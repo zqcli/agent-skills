@@ -69,6 +69,29 @@ validate_arg() {
     fi
 }
 
+build_proxy_command() {
+    local proxy="$1" proxy_type="$2"
+
+    if command -v connect.exe &>/dev/null; then
+        local flag="-S"
+        [[ "$proxy_type" == "http" ]] && flag="-H"
+        echo "ProxyCommand=connect.exe $flag $proxy %h %p"
+        return 0
+    fi
+
+    if command -v nc &>/dev/null && nc -h 2>&1 | grep -q '\-X'; then
+        local flag="-X 5"
+        [[ "$proxy_type" == "http" ]] && flag="-X connect"
+        echo "ProxyCommand=nc $flag -x $proxy %h %p"
+        return 0
+    fi
+
+    echo "Error: No proxy-capable tool found. Install one:" >&2
+    echo "  Ubuntu/Debian: sudo apt install netcat-openbsd"     >&2
+    echo "  macOS:         (built-in nc should work)"            >&2
+    return 1
+}
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -160,12 +183,9 @@ SSH_OPTS=(
     -p "$PORT"
 )
 
-# Add proxy if specified
 if [[ -n "$PROXY" ]]; then
-    PROXY_FLAG="-S"
-    [[ "$PROXY_TYPE" == "http" ]] && PROXY_FLAG="-H"
-    
-    SSH_OPTS+=(-o "ProxyCommand=connect.exe $PROXY_FLAG $PROXY %h %p")
+    proxy_cmd=$(build_proxy_command "$PROXY" "$PROXY_TYPE") || exit 1
+    SSH_OPTS+=(-o "$proxy_cmd")
 fi
 
 # Create askpass helper

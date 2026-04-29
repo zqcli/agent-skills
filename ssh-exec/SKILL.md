@@ -5,8 +5,8 @@ license: MIT
 compatibility: opencode
 allowed-tools: Bash(scripts/ssh-exec.sh:*)
 metadata:
-  version: "0.6"
-  platform: windows
+    version: "0.7"
+  platform: windows, macos, linux
   category: remote-execution
   auth-methods: key, password
   environments: public, enterprise
@@ -124,6 +124,17 @@ scripts/ssh-exec.sh -s example.com -u admin -c "for i in 1 2 3; do echo line-\$i
 ---
 
 ## 代理配置
+
+### 平台感知
+
+代理工具由 `build_proxy_command()` 函数自动检测：
+
+| 平台 | 代理工具 | ProxyCommand 示例 |
+|------|---------|-------------------|
+| Windows (MSYS2) | `connect.exe` | `connect.exe -S proxy:1080 %h %p` |
+| macOS / Debian / Ubuntu | `nc` (netcat-openbsd) | `nc -X 5 -x proxy:1080 %h %p` |
+
+如果没有检测到代理工具，脚本会报错并给出安装指引。
 
 ### 用户责任
 - 用户自行负责启动和维护代理服务
@@ -287,6 +298,7 @@ debug1: read_passphrase: can't open /dev/tty: No such device or address
 
 ## 版本历史
 
+- **3.2**：代理工具平台感知，封装 `build_proxy_command()` 函数，macOS/Linux 使用 `nc`，Windows 使用 `connect.exe`
 - **3.1**：修复两个关键bug：路径转换使用 `$USERPROFILE`、持续输出改为实时流式输出
 - **3.0**：完全重构为 Bash 版本，使用 SSH_ASKPASS 机制，适配 MSYS2 UCRT64 环境
 - **2.0**：添加密码认证支持，移除硬编码服务器信息
