@@ -1,0 +1,3 @@
+[submodule "obsidian-livesync-skill"]
+	path = obsidian-livesync-skill
+	url = https://github.com/zqcli/obsidian-livesync-skill
