@@ -12,7 +12,7 @@ compatibility: >
   Fast Note Sync Service instance.
 metadata:
   author: https://github.com/zqcli
-  version: "1.0.0"
+  version: "1.1.0"
 allowed-tools: Bash
 ---
 
@@ -28,6 +28,7 @@ CRUD operations on remote Obsidian notes using the [Fast Note Sync Service](http
 | `FNS_USERNAME` | Yes | Login username |
 | `FNS_PASSWORD` | Yes | Login password |
 | `FNS_VAULT` | No | Default vault name (can be overridden per command) |
+| `FNS_PROXY` | No | Proxy URL for accessing the server through SOCKS5 or HTTP proxy (e.g. `socks5h://127.0.0.1:1080`, `http://proxy:8080`) |
 
 Credentials can be set via environment variables or passed inline.
 
@@ -36,7 +37,16 @@ Credentials can be set via environment variables or passed inline.
 Before any note operation, obtain an auth token by logging in:
 
 ```bash
-TOKEN=$(curl -s -X POST "${FNS_BASE_URL}/api/user/login" \
+# Build proxy argument if FNS_PROXY is set
+if [ -n "${FNS_PROXY}" ]; then
+  case "${FNS_PROXY}" in
+    socks5h://*) PROXY_ARG="--socks5-hostname ${FNS_PROXY#socks5h://}" ;;
+    socks5://*)  PROXY_ARG="--socks5 ${FNS_PROXY#socks5://}" ;;
+    *)           PROXY_ARG="--proxy ${FNS_PROXY}" ;;
+  esac
+fi
+
+TOKEN=$(curl -s ${PROXY_ARG} -X POST "${FNS_BASE_URL}/api/user/login" \
   -H "Content-Type: application/json" \
   -d "{\"credentials\":\"${FNS_USERNAME}\",\"password\":\"${FNS_PASSWORD}\"}" \
   | jq -r '.data.token')
@@ -49,6 +59,27 @@ The token is passed via `Authorization` header on all subsequent requests (note:
 ```
 
 Tokens expire after a period of inactivity (error code `508`). Re-login to obtain a fresh token.
+
+## Proxy
+
+When the Fast Note Sync server is behind a firewall or only accessible from an intranet, set `FNS_PROXY` to route traffic through a proxy. Append `${PROXY_ARG}` to every curl command — the proxy argument builder above auto-detects the protocol.
+
+| Format | curl Flag | DNS Resolution |
+|---|---|---|
+| `socks5h://host:port` | `--socks5-hostname` | Remote (via proxy) |
+| `socks5://host:port` | `--socks5` | Local |
+| `http://host:port` | `--proxy` | Local |
+| `http://user:pass@host:port` | `--proxy` | Local (with auth) |
+
+**Example** — SOCKS5 proxy with remote DNS:
+```bash
+export FNS_PROXY=socks5h://127.0.0.1:1080
+```
+
+**Verification** — test connectivity through the proxy:
+```bash
+curl -s ${PROXY_ARG} "${FNS_BASE_URL}/api/health" | jq .
+```
 
 ## Response Format
 
@@ -422,6 +453,7 @@ curl -s -X GET "${FNS_BASE_URL}/api/notes?vault=${FNS_VAULT}&keyword=meeting&sea
 - **Concurrency**: The `contentHash` and `baseHash` fields support conflict detection. The server returns the latest `contentHash` after each write — store it for subsequent updates.
 - **Vault auto-creation**: Vaults are created automatically on first use. No explicit vault creation needed for note operations.
 - **JSON escaping**: When passing content with special characters (quotes, backslashes, newlines), use `jq -Rs .` to properly escape file contents.
+- **Proxy**: Set `FNS_PROXY` to route traffic through SOCKS5 or HTTP proxy. Append `${PROXY_ARG}` after `curl` in every request. Build `PROXY_ARG` once with the snippet shown in the Authentication section.
 
 ## Edge Cases
 
