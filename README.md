@@ -26,6 +26,7 @@ agent-skills/
 
 | Skill | Version | Description |
 |---|---|---|
+| [bitwarden-skill](./bitwarden-skill/) | 0.2.0 | CRUD on Bitwarden/Vaultwarden vault items via bw CLI |
 | [ssh-exec](./ssh-exec/) | 0.7 | Remote SSH command execution with key and password authentication |
 | [obsidian-fastnotesync-skill](./obsidian-fastnotesync-skill/) | 1.1.0 | CRUD on remote Obsidian notes via Fast Note Sync Service REST API |
 | [obsidian-livesync-skill](./obsidian-livesync-skill/) | 1.4.0 | CRUD on Obsidian LiveSync CouchDB database |
