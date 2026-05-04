@@ -21,6 +21,28 @@ agent-skills/
     └── SKILL.md
 ```
 
+
+## Skills
+
+| Skill | 版本 | 说明 |
+|---|---|---|
+| [ssh-exec](./ssh-exec/) | 0.7 | SSH 远程命令执行，支持密钥和密码认证 |
+| [obsidian-fastnotesync-skill](./obsidian-fastnotesync-skill/) | 1.1.0 | 通过 Fast Note Sync Service REST API 对远程 Obsidian 笔记进行增删改查 |
+| [obsidian-livesync-skill](./obsidian-livesync-skill/) | 1.4.0 | 对 Obsidian LiveSync CouchDB 数据库进行增删改查 |
+
+### 更新日志
+
+**obsidian-fastnotesync-skill**
+- v1.1.0 — 新增代理支持（SOCKS5/HTTP），适用于内网访问
+- v1.0.0 — 初始版本：CREATE、READ、UPDATE、DELETE、LIST、APPEND、PREPEND、REPLACE、RENAME、FRONTMATTER
+
+**ssh-exec**
+- v0.7 — 跨平台代理支持（通过 build_proxy_command()）
+- v0.5 — 初始版本
+
+**obsidian-livesync-skill**
+- v1.4.0 — 最新（git 子模块）
+
 ## Skill 格式
 
 每个 skill **必须**包含一个 `SKILL.md` 文件，包含 YAML 前置元数据和 Markdown 正文：

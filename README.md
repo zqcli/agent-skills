@@ -21,6 +21,28 @@ agent-skills/
     └── SKILL.md
 ```
 
+
+## Skills
+
+| Skill | Version | Description |
+|---|---|---|
+| [ssh-exec](./ssh-exec/) | 0.7 | Remote SSH command execution with key and password authentication |
+| [obsidian-fastnotesync-skill](./obsidian-fastnotesync-skill/) | 1.1.0 | CRUD on remote Obsidian notes via Fast Note Sync Service REST API |
+| [obsidian-livesync-skill](./obsidian-livesync-skill/) | 1.4.0 | CRUD on Obsidian LiveSync CouchDB database |
+
+### Changelog
+
+**obsidian-fastnotesync-skill**
+- v1.1.0 — Add proxy support (SOCKS5/HTTP) for intranet access
+- v1.0.0 — Initial release: CREATE, READ, UPDATE, DELETE, LIST, APPEND, PREPEND, REPLACE, RENAME, FRONTMATTER
+
+**ssh-exec**
+- v0.7 — Platform-aware proxy via build_proxy_command()
+- v0.5 — Initial release
+
+**obsidian-livesync-skill**
+- v1.4.0 — Latest (git submodule)
+
 ## Skill Format
 
 Every skill **must** contain a `SKILL.md` file with YAML frontmatter and Markdown body:
