@@ -11,7 +11,7 @@ compatibility: >
 allowed-tools: Bash
 metadata:
   author: https://github.com/zqcli
-  version: "0.4.1"
+  version: "0.4.2"
 ---
 
 # Bitwarden Skill
@@ -81,7 +81,7 @@ All subcommands support these flags before the subcommand name:
 
 ### resolve — Batch `bw://` URI Resolution
 
-Resolve multiple `bw://` URIs in a single call. This is the **default subcommand** — you can omit `resolve`.
+**No flags.** Positional: one or more `bw://"Item"/field` URIs. This is the **default subcommand** — you can omit `resolve`.
 
 **URI format**: `bw://"Item Name"/{field}`
 
@@ -166,7 +166,7 @@ Return:
 
 ### get — Get Single Item
 
-Supports lookup by **id** or **exact name** (case-sensitive).
+Positional: `<id|name>` — exact name match, case-sensitive.
 
 | Flag | Description |
 |---|---|
@@ -212,9 +212,9 @@ Return:
 
 ### create — Create Item
 
-Accepts JSON as a **string argument**, **file path**, or **stdin** (`-`). Base64 encoding is handled internally.
+**No flags.** Positional: JSON string, file path, or `-` for stdin.
 
-Item types: `1`=Login, `2`=Secure Note, `3`=Card, `4`=Identity.
+Base64 encoding is handled internally. Item types: `1`=Login, `2`=Secure Note, `3`=Card, `4`=Identity.
 
 **Example — Login (JSON string):**
 
@@ -260,7 +260,7 @@ echo '{"type":1,"name":"Piped","login":{"username":"u","password":"p","uris":[]}
 
 ### edit — Edit Item
 
-Uses a **jq patch expression** to modify fields. The script fetches the full item, applies the jq expression, base64-encodes, and sends the update.
+**No flags.** Positional: `<id> <jq-patch>`. Uses a **jq patch expression** to modify fields. The script fetches the full item, applies the jq expression, base64-encodes, and sends the update.
 
 Requires **item id** (use `list` or `get` to find it first).
 
@@ -293,7 +293,7 @@ bash scripts/bw.sh -p '***' edit abc-123 '.favorite=true'
 
 ### delete — Delete Item
 
-Supports **id** or **exact name**.
+**No flags.** Positional: `<id|name>`.
 
 ```bash
 bash scripts/bw.sh -p '***' delete abc-123
@@ -311,6 +311,8 @@ First delete moves to trash; second delete permanently removes.
 ---
 
 ### folders — List Folders
+
+**No flags.**
 
 ```bash
 bash scripts/bw.sh -p '***' folders
@@ -336,7 +338,7 @@ echo -n "New Folder" | bw encode | xargs -0 bw create folder
 
 ### lock — Lock Vault
 
-Locks the vault (clears the decryption key from memory). No password needed.
+**No flags.** Locks the vault (clears the decryption key from memory).
 
 ```bash
 bash scripts/bw.sh lock
@@ -350,7 +352,7 @@ Return:
 
 ### logout — Log Out
 
-Logs out completely, clearing local credentials. Requires `-e` + `-p` on next use to re-login.
+**No flags.** Logs out completely, clearing local credentials. Requires `-e` + `-p` on next use to re-login.
 
 ```bash
 bash scripts/bw.sh logout
