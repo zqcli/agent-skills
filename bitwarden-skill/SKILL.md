@@ -1,302 +1,410 @@
 ---
 name: bitwarden-skill
 description: >
-  Manage Bitwarden/Vaultwarden vault items (passwords, notes, cards, identities)
-  via the Bitwarden CLI (bw). Create, read, update, delete, and search vault
-  entries including logins, secure notes, credit cards, and identity records.
-  Use when the user wants to manage passwords, retrieve credentials, store
-  secrets, or query their vault.
+  Manage Bitwarden/Vaultwarden vault items via the official bw CLI.
+  Supports batch URI resolution (bw://"Item"/field), CRUD on logins,
+  notes, cards, and identities with unified JSON output.
 license: MIT
 compatibility: >
-  Requires Bitwarden CLI (bw) installed and configured.
-  Compatible with Bitwarden official and Vaultwarden self-hosted servers.
+  Requires Bitwarden CLI (bw). Compatible with official Bitwarden and
+  Vaultwarden self-hosted servers.
 allowed-tools: Bash
 metadata:
   author: https://github.com/zqcli
-  version: "0.2.0"
+  version: "0.4.1"
 ---
 
 # Bitwarden Skill
 
-Manage Bitwarden/Vaultwarden vault items via the official `bw` CLI. All data is decrypted client-side — the skill returns plaintext values.
+All vault operations go through `scripts/bw.sh` — a self-contained wrapper that handles auto-unlock, base64 encoding, and unified JSON output.
 
 ## Prerequisites
 
 | Requirement | Description |
 |---|---|
-| `bw` CLI | [Bitwarden CLI](https://bitwarden.com/help/cli/) must be installed and in `PATH` |
-| Vault Host | Provide the Vaultwarden/Bitwarden server URL |
-| Master Password | User must **type it manually each session** (never stored or hardcoded) |
+| `bw` CLI | [Bitwarden CLI](https://bitwarden.com/help/cli/) installed and in `PATH` |
+| `jq` | JSON processor (for `bw.sh` output parsing) |
+| Vault Host | Your Bitwarden/Vaultwarden server URL |
+| Master Password | Passed via `-p` flag or `BW_PASSWORD` env var each invocation |
 
 ## Setup (One-Time)
 
-Configure the server endpoint and log in. This persists your account credentials locally.
+`bw.sh` auto-handles login, unlock, and session renewal. On first use, just pass `-e` with your email:
 
 ```bash
-# Configure the server
+bash scripts/bw.sh -e you@example.com -p 'masterpwd' 'bw://"Item"/password'
+```
+
+This will `bw login` + `bw unlock` automatically. Subsequent invocations only need `-p`:
+
+```bash
+bash scripts/bw.sh -p 'masterpwd' 'bw://"Item"/password'
+```
+
+If you prefer to set up manually:
+
+```bash
 bw config server https://vault.example.com
-
-# Log in (stores encrypted credentials locally, permanent until logout)
-bw login your-email@example.com
+bw login you@example.com
 ```
 
-**Check current status** at any time:
+## Quick Start
 
 ```bash
-bw status | jq .
-# { "serverUrl": "https://...", "status": "unlocked", "userEmail": "..." }
+# First use (auto login + unlock)
+bash scripts/bw.sh -e you@example.com -p 'masterpwd' 'bw://"My Server"/password'
+
+# Subsequent uses (auto unlock only)
+bash scripts/bw.sh -p 'masterpwd' list --search "github"
+bash scripts/bw.sh -p 'masterpwd' get "My Server" --field username
 ```
 
-## Authentication (Per Session)
+**All output is JSON**: `{"success":true,"data":...}` or `{"success":false,"error":"..."}`.
 
-Each session requires unlocking with your master password. The session token expires after a configurable period (default 12 hours).
+---
 
-### Step 1: Unlock
+## Command Reference
 
-The user is prompted to type their master password:
+### Global Options
+
+All subcommands support these flags before the subcommand name:
+
+| Flag | Description |
+|---|---|
+| `-e`, `--email <email>` | Login email — required if not yet logged in (or set `BW_EMAIL` env) |
+| `-p`, `--password <pwd>` | Master password (or set `BW_PASSWORD` env var) |
+| `-s`, `--sync` | Sync vault before reading (for `resolve`, `list`, `get`, `folders`) |
+| `--no-unlock` | Skip session setup — use when `BW_SESSION` is already valid |
+| `-h`, `--help` | Show help |
+
+---
+
+### resolve — Batch `bw://` URI Resolution
+
+Resolve multiple `bw://` URIs in a single call. This is the **default subcommand** — you can omit `resolve`.
+
+**URI format**: `bw://"Item Name"/{field}`
+
+| Field Path | Resolves To |
+|---|---|
+| `/password` | `login.password` |
+| `/username` | `login.username` |
+| `/totp` | Live 6-digit TOTP code |
+| `/notes` | `notes` |
+| `/uri` | `login.uris[0].uri` |
+| `/fields/<name>` | Custom field value |
+
+**Example — single URI:**
 
 ```bash
-export BW_SESSION=$(bw unlock --raw)
-# User types master password at the interactive prompt
+bash scripts/bw.sh -p '***' 'bw://"GitHub"/password'
 ```
 
-Verify unlock succeeded:
+Return:
 
-```bash
-bw status | jq '.status'   # Should output "unlocked"
+```json
+{"success":true,"data":{"GitHub":{"password":"***"}}}
 ```
 
-### Step 2: Use the session
-
-All subsequent `bw` commands automatically use `BW_SESSION`. No need to re-unlock until expiry.
-
-### Session Expiry
-
-If commands fail with `not logged in` or `session expired`:
+**Example — multiple URIs, auto-merged by item name:**
 
 ```bash
-export BW_SESSION=$(bw unlock --raw)
+bash scripts/bw.sh -p '***' \
+  'bw://"API Gateway"/password' \
+  'bw://"API Gateway"/fields/api_key' \
+  'bw://"DB Server"/username'
+```
+
+Return:
+
+```json
+{"success":true,"data":{
+  "API Gateway":{"password":"***","api_key":"sk-***"},
+  "DB Server":{"username":"dbadmin"}
+}}
+```
+
+**Example — item not found:**
+
+```bash
+bash scripts/bw.sh -p '***' 'bw://"Missing"/password'
+```
+
+Return:
+
+```json
+{"success":true,"data":{"Missing":{"password":"NOT FOUND"}}}
 ```
 
 ---
 
-## Sync Before Read
+### list — List Vault Items
 
-**Always sync before read operations** to ensure data is up-to-date with the server:
+| Flag | Description |
+|---|---|
+| `--search <term>` | Substring match on name/URI |
+| `--type <n>` | Filter by type: `1`=Login, `2`=Note, `3`=Card, `4`=Identity |
+| `--folder <id>` | Filter by folder ID |
+| `--trash` | List trashed items only |
+
+**Example:**
 
 ```bash
-bw sync
+bash scripts/bw.sh -p '***' list --search "aws" --type 1
 ```
 
-This pulls the latest vault state from the server. Skip sync for write-only operations (create/edit/delete) since those talk to the server directly.
+Return:
 
----
-
-## CRUD Operations
-
-All commands below assume `BW_SESSION` is exported and `bw sync` has been run before reads.
-
-### LIST — List All Items
-
-```bash
-bw sync && bw list items | jq .
-```
-
-**Filter options**:
-
-```bash
-# List only logins
-bw list items --type 1 | jq .
-
-# Search by name or URI (case-insensitive substring match)
-bw list items --search "github" | jq .
-
-# List items in a folder
-bw list items --folderid <folder-id> | jq .
-
-# List only trashed items
-bw list items --trash | jq .
-```
-
-**Shorthand** — print a compact summary table:
-
-```bash
-bw list items | jq -r '.[] | "\(.id) | \(.name) | \(.login.username // "-")"'
-```
-
-### READ — Get a Single Item
-
-```bash
-bw sync && bw get item <item-id> | jq .
-```
-
-**Convenience shortcuts** — extract specific fields:
-
-```bash
-bw get password <item-id>   # Returns password only
-bw get username <item-id>   # Returns username only
-bw get totp <item-id>       # Returns TOTP code (6-digit, time-based)
-bw get notes <item-id>      # Returns notes only
-bw get uri <item-id>        # Returns the primary URI
-```
-
-### CREATE — Create an Item
-
-Item types: `1` = Login, `2` = Secure Note, `3` = Card, `4` = Identity.
-
-**JSON must be base64-encoded** before passing to `bw create item`. Use the pipe pattern: `echo '<json>' | base64 | bw create item`.
-
-**Login (type 1)**:
-
-```bash
-echo '{"type":1,"name":"GitHub","notes":"Personal account","favorite":true,"login":{"username":"user@example.com","password":"mySecret123","uris":[{"uri":"https://github.com","match":null}]}}' | base64 | bw create item
-```
-
-Or write JSON to a file for readability:
-
-```bash
-cat > /tmp/item.json << 'JSON'
-{
-  "type": 1,
-  "name": "GitHub",
-  "notes": "Personal account",
-  "favorite": true,
-  "login": {
-    "username": "user@example.com",
-    "password": "mySecret123",
-    "uris": [{"uri": "https://github.com", "match": null}]
-  }
-}
-JSON
-base64 /tmp/item.json | bw create item
-```
-
-**Secure Note (type 2)**:
-
-```bash
-echo '{"type":2,"name":"Server Access","notes":"SSH key passphrase: hunter2\nIP: 10.0.0.1","secureNote":{"type":0}}' | base64 | bw create item
-```
-
-**Card (type 3)**:
-
-```bash
-echo '{"type":3,"name":"Visa Card","card":{"cardholderName":"John Doe","brand":"Visa","number":"4111111111111111","expMonth":"12","expYear":"2028","code":"123"}}' | base64 | bw create item
-```
-
-**Identity (type 4)**:
-
-```bash
-echo '{"type":4,"name":"John Doe","identity":{"title":"Mr","firstName":"John","lastName":"Doe","email":"john@example.com","phone":"1234567890","address1":"123 Main St","city":"Springfield","state":"IL","postalCode":"62701","country":"US"}}' | base64 | bw create item
-```
-
-**Create in root folder** (omit `folderId` or set it to `null`):
-
-```bash
-echo '{"type":1,"name":"Root Item","folderId":null,"login":{"username":"user","password":"pass","uris":[]}}' | base64 | bw create item
-```
-
-### UPDATE — Edit an Item
-
-`bw edit item` requires the **full item JSON** (not just the changed fields) and must be **base64-encoded**. The recommended pattern: get the current item, modify with `jq`, pipe to `base64`, then edit.
-
-```bash
-bw get item <item-id> | jq '.name = "New Name" | .notes = "Updated notes"' | base64 | bw edit item <item-id>
-```
-
-**Update password** (the password field is inside the `login` object):
-
-```bash
-bw get item <item-id> | jq '.login.password = "newPassword"' | base64 | bw edit item <item-id>
-```
-
-**Move to a folder**:
-
-```bash
-bw get item <item-id> | jq '.folderId = "<folder-id>"' | base64 | bw edit item <item-id>
-```
-
-**Toggle favorite**:
-
-```bash
-bw get item <item-id> | jq '.favorite = true' | base64 | bw edit item <item-id>
-```
-
-### DELETE — Delete an Item
-
-```bash
-bw delete item <item-id>
-```
-
-**Restore from trash**:
-
-```bash
-bw restore item <item-id>
+```json
+{"success":true,"data":[
+  {"id":"abc-123","name":"AWS Console","type":1,"folderId":"f-id","username":"admin@example.com"},
+  {"id":"def-456","name":"AWS IAM","type":1,"folderId":"f-id","username":"iam-user"}
+]}
 ```
 
 ---
 
-## Folder Management
+### get — Get Single Item
 
-### List Folders
+Supports lookup by **id** or **exact name** (case-sensitive).
+
+| Flag | Description |
+|---|---|
+| `--field <f>` | Extract single field: `password`, `username`, `totp`, `notes`, `uri` |
+
+**Example — get by name:**
 
 ```bash
-bw sync && bw list folders | jq -r '.[] | "\(.id) | \(.name)"'
+bash scripts/bw.sh -p '***' get "GitHub" --field password
 ```
 
-### Create Folder
+Return:
 
-```bash
-echo -n "Folder Name" | bw encode | xargs -0 bw create folder
+```json
+{"success":true,"data":"***"}
 ```
 
-### Delete Folder
+**Example — get by name, full item (no `--field`):**
 
 ```bash
-bw delete folder <folder-id>
+bash scripts/bw.sh -p '***' get "GitHub"
+```
+
+Return:
+
+```json
+{"success":true,"data":{"id":"abc-123","name":"GitHub","type":1,"login":{"username":"user","password":"***","uris":[{"uri":"https://github.com"}]},...}}
+```
+
+**Example — TOTP code:**
+
+```bash
+bash scripts/bw.sh -p '***' get "Ivanti" --field totp
+```
+
+Return:
+
+```json
+{"success":true,"data":"123456"}
+```
+
+---
+
+### create — Create Item
+
+Accepts JSON as a **string argument**, **file path**, or **stdin** (`-`). Base64 encoding is handled internally.
+
+Item types: `1`=Login, `2`=Secure Note, `3`=Card, `4`=Identity.
+
+**Example — Login (JSON string):**
+
+```bash
+bash scripts/bw.sh -p '***' create \
+  '{"type":1,"name":"My App","login":{"username":"user","password":"secret","uris":[{"uri":"https://app.example.com"}]}}'
+```
+
+Return:
+
+```json
+{"success":true,"data":{"id":"new-uuid","name":"My App","type":1,"folderId":null}}
+```
+
+**Example — Secure Note:**
+
+```bash
+bash scripts/bw.sh -p '***' create \
+  '{"type":2,"name":"Server Notes","notes":"DB: 10.0.0.1\nPass: ***","secureNote":{"type":0}}'
+```
+
+**Example — Card:**
+
+```bash
+bash scripts/bw.sh -p '***' create \
+  '{"type":3,"name":"Visa","card":{"cardholderName":"John","brand":"Visa","number":"4111111111111111","expMonth":"12","expYear":"2028","code":"123"}}'
+```
+
+**Example — from file:**
+
+```bash
+bash scripts/bw.sh -p '***' create /path/to/item.json
+```
+
+**Example — from stdin:**
+
+```bash
+echo '{"type":1,"name":"Piped","login":{"username":"u","password":"p","uris":[]}}' \
+  | bash scripts/bw.sh -p '***' create -
+```
+
+---
+
+### edit — Edit Item
+
+Uses a **jq patch expression** to modify fields. The script fetches the full item, applies the jq expression, base64-encodes, and sends the update.
+
+Requires **item id** (use `list` or `get` to find it first).
+
+**Example — change name and password:**
+
+```bash
+bash scripts/bw.sh -p '***' edit abc-123 \
+  '.name="New Name" | .login.password="newSecret"'
+```
+
+Return:
+
+```json
+{"success":true,"data":{"id":"abc-123","name":"New Name","revisionDate":"2025-01-01T00:00:00.000Z"}}
+```
+
+**Example — move to folder:**
+
+```bash
+bash scripts/bw.sh -p '***' edit abc-123 '.folderId="folder-uuid"'
+```
+
+**Example — toggle favorite:**
+
+```bash
+bash scripts/bw.sh -p '***' edit abc-123 '.favorite=true'
+```
+
+---
+
+### delete — Delete Item
+
+Supports **id** or **exact name**.
+
+```bash
+bash scripts/bw.sh -p '***' delete abc-123
+bash scripts/bw.sh -p '***' delete "My Old Item"
+```
+
+Return:
+
+```json
+{"success":true,"data":{"deleted":true,"id":"abc-123"}}
+```
+
+First delete moves to trash; second delete permanently removes.
+
+---
+
+### folders — List Folders
+
+```bash
+bash scripts/bw.sh -p '***' folders
+```
+
+Return:
+
+```json
+{"success":true,"data":[
+  {"id":"f1","name":"Personal"},
+  {"id":"f2","name":"Personal/Finance"},
+  {"id":"f3","name":"Work"}
+]}
+```
+
+### folders — Create Folder (raw bw CLI)
+
+Folder creation is not wrapped in `bw.sh`. Use the raw `bw` CLI:
+
+```bash
+echo -n "New Folder" | bw encode | xargs -0 bw create folder
+```
+
+### lock — Lock Vault
+
+Locks the vault (clears the decryption key from memory). No password needed.
+
+```bash
+bash scripts/bw.sh lock
+```
+
+Return:
+
+```json
+{"success":true,"data":"locked"}
+```
+
+### logout — Log Out
+
+Logs out completely, clearing local credentials. Requires `-e` + `-p` on next use to re-login.
+
+```bash
+bash scripts/bw.sh logout
+```
+
+Return:
+
+```json
+{"success":true,"data":"logged out"}
 ```
 
 ---
 
 ## Item Type Reference
 
-| Type | Value | CLI filter | Description |
-|---|---|---|---|
-| Login | `1` | `--type 1` | Username, password, URI, TOTP |
-| Secure Note | `2` | `--type 2` | Free-form text note |
-| Card | `3` | `--type 3` | Credit/debit card details |
-| Identity | `4` | `--type 4` | Personal information |
+| Type | Value | Description |
+|---|---|---|
+| Login | `1` | Username, password, URI, TOTP |
+| Secure Note | `2` | Free-form text |
+| Card | `3` | Card number, expiry, CVV, cardholder |
+| Identity | `4` | Name, address, email, phone |
 
 ---
 
 ## Important Notes
 
-- **Master password is never stored** — the user must type it at `bw unlock` each session.
-- **BW_SESSION is temporary** — expires after inactivity (default 12h). If commands start failing, re-run `bw unlock`.
-- **Sync before reads** — always run `bw sync` before `bw get` or `bw list` to get the latest server data.
-- **Write operations go directly to the server** — `bw create`, `bw edit`, `bw delete` do not need a prior `bw sync`.
-- **bw login persists** — credentials are stored locally and survive reboots. Only need to re-login after `bw logout` or on a new machine.
-- **JSON payloads must be base64-encoded** — `bw create item` and `bw edit item` require base64-encoded JSON input. Use the pattern: `echo '<json>' | base64 | bw create item` or `bw get item <id> | jq '...' | base64 | bw edit item <id>`.
-- **Full object required for edit** — `bw edit item` needs the complete item JSON, not partial fields. Always pipe through `bw get item <id>` first, modify with `jq`, then edit.
-- **Exit codes** — `bw` returns 0 on success, non-zero on failure. Check `$?` after critical commands.
+- **Three-state session handling**: `bw.sh` detects `unauthenticated` → logs in, `locked` → unlocks, `unlocked` → skips. No manual `bw login` or `bw unlock` needed.
+- **`-e` only needed once**: After `bw login` succeeds, subsequent invocations only need `-p`. Passing `-e` again is harmless — it won't re-login.
+- **Password via `-p` or env**: Pass master password with `-p` flag or `export BW_PASSWORD=...`. Also works with `export BW_EMAIL=...`.
+- **Unified JSON output**: All subcommands return `{"success":true,"data":...}` or `{"success":false,"error":"..."}`. Parse with `jq`.
+- **Exact name matching**: `resolve`, `get`, and `delete` match item names exactly (case-sensitive).
+- **resolve is default**: Running `bw.sh` with `bw://` URIs and no subcommand automatically uses `resolve`.
+- **resolve returns NOT FOUND, not null**: Missing items/fields return `"NOT FOUND"` string — prevents silent failures in pipelines.
+- **Base64 handled internally**: `create` and `edit` handle base64 encoding transparently. Pass plain JSON or jq expressions.
+- **First delete is soft**: Items go to trash on first delete. Second delete on the same item removes permanently.
 
-## Error Codes
+## Error Reference
 
-| Exit Code | Cause | Solution |
+| Output | Cause | Solution |
 |---|---|---|
-| 1 | Not logged in | Run `bw login` |
-| 1 | Session expired | Run `bw unlock --raw` and export `BW_SESSION` |
-| 1 | Item not found | Check item ID with `bw list items` |
-| 1 | Invalid JSON | Validate JSON syntax; use `jq` to format |
-| 1 | Server unreachable | Check vault host URL and network connectivity |
+| `{"success":false,"error":"BW_PASSWORD not set..."}` | No `-p` flag or `BW_PASSWORD` env | Add `-p 'password'` |
+| `{"success":false,"error":"bw unlock failed..."}` | Wrong master password | Check password |
+| `{"success":false,"error":"item not found: X"}` | Item doesn't exist (or name mismatch) | Check exact name with `list --search` |
+| `{"success":false,"error":"invalid JSON"}` | Malformed JSON in create | Validate with `jq empty` |
+| `{"success":false,"error":"unknown subcommand: X"}` | Typo in subcommand name | Use `-h` for help |
 
 ## Edge Cases
 
 | Scenario | Behavior |
 |---|---|
-| Session expired during operation | Command fails. Re-run `bw unlock` and retry. |
-| Item already in trash (delete twice) | Second delete permanently removes the item. |
-| Create with duplicate name | Allowed (Bitwarden does not enforce unique names). |
-| Empty vault | `bw list items` returns `[]`. |
-| TOTP field empty | `bw get totp <id>` returns nothing or error. |
-| Password contains special characters (quotes, `$`, `\`) | Use single-quoted JSON strings or `bw encode` for safety. |
-| Network timeout during sync | `bw sync` times out; retry. |
+| Session expired mid-operation | `bw.sh` auto-reunlocks |
+| Item name contains `"` or `/` | `bw://` parsing handles it via awk field splitting |
+| Password contains special chars (`$`, `\`, `"`) | JSON-safe; `bw.sh` uses `printf` not `echo` |
+| Create duplicate name | Allowed (Bitwarden doesn't enforce uniqueness) |
+| Empty vault | `list` returns `{"success":true,"data":[]}` |
+| Delete non-existent item | `{"success":false,"error":"item not found: X"}` |
+| `--no-unlock` without valid session | `bw` prompts for password interactively (may hang in non-TTY) |
