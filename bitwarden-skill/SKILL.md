@@ -11,7 +11,7 @@ compatibility: >
 allowed-tools: Bash
 metadata:
   author: https://github.com/zqcli
-  version: "0.4.2"
+  version: "0.5.0"
 ---
 
 # Bitwarden Skill
@@ -73,6 +73,7 @@ All subcommands support these flags before the subcommand name:
 |---|---|
 | `-e`, `--email <email>` | Login email — required if not yet logged in (or set `BW_EMAIL` env) |
 | `-p`, `--password <pwd>` | Master password (or set `BW_PASSWORD` env var) |
+| `--proxy <url>` | Route all bw traffic through proxy: `socks5://`, `socks5h://`, `http://`, `https://` |
 | `-s`, `--sync` | Sync vault before reading (for `resolve`, `list`, `get`, `folders`) |
 | `--no-unlock` | Skip session setup — use when `BW_SESSION` is already valid |
 | `-h`, `--help` | Show help |
@@ -388,6 +389,7 @@ Return:
 - **resolve returns NOT FOUND, not null**: Missing items/fields return `"NOT FOUND"` string — prevents silent failures in pipelines.
 - **Base64 handled internally**: `create` and `edit` handle base64 encoding transparently. Pass plain JSON or jq expressions.
 - **First delete is soft**: Items go to trash on first delete. Second delete on the same item removes permanently.
+- **Proxy via `--proxy`**: Set `--proxy socks5h://127.0.0.1:1080` to route all bw network traffic through a proxy. Supports `socks5://` (local DNS), `socks5h://` (remote DNS), `http://`, and `https://`. Sets `HTTP_PROXY`/`HTTPS_PROXY` environment variables.
 
 ## Error Reference
 

@@ -26,7 +26,7 @@ agent-skills/
 
 | Skill | 版本 | 说明 |
 |---|---|---|
-| [bitwarden-skill](./bitwarden-skill/) | 0.4.1 | 通过 bw.sh 脚本对 Bitwarden/Vaultwarden 密码库条目进行增删改查 |
+| [bitwarden-skill](./bitwarden-skill/) | 0.5.0 | 通过 bw.sh 脚本对 Bitwarden/Vaultwarden 密码库条目进行增删改查 |
 | [ssh-exec](./ssh-exec/) | 0.7 | SSH 远程命令执行，支持密钥和密码认证 |
 | [obsidian-fastnotesync-skill](./obsidian-fastnotesync-skill/) | 1.1.0 | 通过 Fast Note Sync Service REST API 对远程 Obsidian 笔记进行增删改查 |
 | [obsidian-livesync-skill](./obsidian-livesync-skill/) | 1.4.0 | 对 Obsidian LiveSync CouchDB 数据库进行增删改查 |

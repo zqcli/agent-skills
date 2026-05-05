@@ -9,13 +9,20 @@
 #   bw.sh -p <pwd> folders
 set -euo pipefail
 
-PASSWORD="" BW_EMAIL="" DO_SYNC=false NO_UNLOCK=false
+PASSWORD="" BW_EMAIL="" PROXY="" DO_SYNC=false NO_UNLOCK=false
 SUBCOMMAND="" SUB_ARGS=()
 
 json_error()   { printf '{"success":false,"error":"%s"}\n' "$1"; exit 1; }
 json_success() { printf '{"success":true,"data":%s}\n' "$1"; }
 
+setup_proxy() {
+  if [ -n "${PROXY:-}" ]; then
+    export HTTPS_PROXY="$PROXY" HTTP_PROXY="$PROXY" https_proxy="$PROXY" http_proxy="$PROXY"
+  fi
+}
+
 ensure_session() {
+  setup_proxy
   [ "$NO_UNLOCK" = true ] && return 0
   local s; s=$(bw status 2>/dev/null | jq -r '.status // "unauthenticated"')
   case "$s" in
@@ -168,6 +175,7 @@ Usage: bw.sh [GLOBAL_OPTS] <SUBCOMMAND> [ARGS]
 Global Options:
   -e, --email <email>     Login email (or set BW_EMAIL env var; required if not logged in)
   -p, --password <pwd>    Master password (or set BW_PASSWORD env var)
+  --proxy <url>           Proxy for all bw network traffic (socks5:// socks5h:// http:// https://)
   -s, --sync              Sync vault before reading
   --no-unlock             Skip authentication (BW_SESSION already set)
   -h, --help              Show this help
@@ -193,6 +201,7 @@ main() {
     case "$1" in
       -e|--email)     BW_EMAIL="$2"; export BW_EMAIL="$2"; shift 2 ;;
       -p|--password) PASSWORD="$2"; export BW_PASSWORD="$2"; shift 2 ;;
+      --proxy)       PROXY="$2"; shift 2 ;;
       -s|--sync)     DO_SYNC=true; shift ;;
       --no-unlock)   NO_UNLOCK=true; shift ;;
       -h|--help)     usage; exit 0 ;;
