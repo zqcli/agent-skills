@@ -5,7 +5,7 @@ license: MIT
 compatibility: opencode
 allowed-tools: Bash(scripts/ssh-exec.sh:*)
 metadata:
-    version: "0.7"
+  version: "0.7"
   platform: windows, macos, linux
   category: remote-execution
   auth-methods: key, password
