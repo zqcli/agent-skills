@@ -1,0 +1,16 @@
+{
+  "name": "web-access",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Web search (Brave) and readable content extraction for AI agents",
+  "author": "https://github.com/zqcli",
+  "license": "MIT",
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "linkedom": "^0.18.0",
+    "turndown": "^7.2.0",
+    "turndown-plugin-gfm": "^1.0.2",
+    "undici": "^7.0.0"
+  }
+}
