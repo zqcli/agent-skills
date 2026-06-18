@@ -1,11 +1,10 @@
 ---
 name: ssh-exec
-description: 在远程服务器执行 SSH 命令，支持密钥密码短语和密码认证。使用 SSH_ASKPASS 机制，适用于 MSYS2 UCRT64 / Git Bash 环境。
+description: 在远程服务器执行 SSH 命令，支持密钥密码短语和密码认证（基于 SSH_ASKPASS 机制）。跨平台：Windows (MSYS2/Git Bash 用 connect.exe)、macOS/Linux (用 nc) 均支持 SOCKS5/HTTP 代理。
 license: MIT
-compatibility: opencode
 allowed-tools: Bash(scripts/ssh-exec.sh:*)
 metadata:
-    version: "0.7"
+  version: "3.3"
   platform: windows, macos, linux
   category: remote-execution
   auth-methods: key, password
@@ -25,10 +24,11 @@ SSH 远程执行工具，使用 SSH_ASKPASS 机制实现自动密码输入。
   1. SSH 密钥 + 密码短语
   2. 传统用户名/密码
   
-- **代理支持**：通过 connect.exe 支持 SOCKS5 和 HTTP 代理
-- **干净输出**：自动过滤 SSH 警告信息
+- **代理支持**：Windows 用 `connect.exe`、macOS/Linux 用 `nc`，支持 SOCKS5 和 HTTP 代理
+- **干净输出**：`LogLevel=ERROR` 过滤 SSH 警告；远端 stdout/stderr 分离透传（不合并）
+- **主机密钥校验**：默认 `accept-new`（TOFU），`--insecure` 可关闭
 - **参数化设计**：无硬编码服务器信息
-- **原生 Bash**：无需 PowerShell，适合 MSYS2 UCRT64 环境
+- **原生 Bash**：无需 PowerShell，跨平台（MSYS2/Git Bash、macOS、Linux）
 
 ---
 
@@ -56,6 +56,7 @@ SSH 远程执行工具，使用 SSH_ASKPASS 机制实现自动密码输入。
 | `-P, --password` | 否 | - | 登录密码或密钥密码短语 |
 | `--proxy` | 否 | - | 代理地址（格式：host:port） |
 | `--proxy-type` | 否 | socks5 | 代理类型：`socks5` 或 `http` |
+| `--insecure` | 否 | - | 关闭主机密钥校验（`StrictHostKeyChecking=no`）；默认用 `accept-new` 校验 |
 | `-t, --timeout` | 否 | 30 | 连接超时时间（秒） |
 | `-h, --help` | 否 | - | 显示帮助信息 |
 
@@ -119,6 +120,14 @@ scripts/ssh-exec.sh -s example.com -u admin -c "for i in 1 2 3; do echo line-\$i
    ```bash
    export SSH_PASSWORD="your-password"
     scripts/ssh-exec.sh -s example.com -u admin -a password -P "$SSH_PASSWORD" -c "hostname"
+   ```
+
+### 主机密钥校验
+- **默认安全**：使用 `StrictHostKeyChecking=accept-new`，首次连接自动记录主机密钥到 `~/.ssh/known_hosts`，之后若密钥变更（可能的中间人攻击）则连接失败。全程不弹交互提示，适合自动化。
+- **`--insecure`**：恢复旧行为（`StrictHostKeyChecking=no` + `UserKnownHostsFile=/dev/null`，不记录、不校验）。仅用于一次性/CI 环境或主机密钥频繁变化的场景，**有中间人风险**。
+   ```bash
+   # 一次性主机，跳过校验
+   scripts/ssh-exec.sh -s example.com -u admin -P "passphrase" -k ~/.ssh/id_ed25519 --insecure -c "hostname"
    ```
 
 ---
@@ -266,7 +275,10 @@ echo $DISPLAY  # 应该显示 :0 或类似值
 | `-P` 或 `--proxy` 作为最后一个参数无值 | 输出 `Error: <flag> requires a value` | 1 |
 | 必填参数缺失（`-s`/`-u`/`-c`） | 输出 usage 并提示缺失项 | 1 |
 | `-a password` 未提供 `-P` | 输出 `Error: Password required for password authentication` | 1 |
-| 密钥文件不可读或不存在 | 输出 `Error: SSH key not found` | 1 |
+| 密钥文件不可读或不存在 | 校验阶段统一拦截，输出 `Error: SSH key not found or not readable`（无论是否带 `-P`） | 1 |
+| 值以 `-` 开头（如 `-c "--version"`） | `validate_arg` 将其视为"缺值"拦截，输出 `Error: -c requires a value`；需用 `sh -c '...'` 包裹规避 | 1 |
+| 主机密钥首次出现 | 默认 `accept-new` 自动记录到 `~/.ssh/known_hosts`，不弹提示 | 远程退出码 |
+| 主机密钥变更（疑似 MITM） | 默认连接失败并报 `REMOTE HOST IDENTIFICATION HAS CHANGED`；`--insecure` 可绕过 | 255 |
 
 ---
 
@@ -298,6 +310,7 @@ debug1: read_passphrase: can't open /dev/tty: No such device or address
 
 ## 版本历史
 
+- **3.3**：修正 frontmatter（YAML 缩进、版本号、移除矛盾的 `compatibility`）；密钥存在性检查统一移到校验阶段（用 `-r`，无论是否带 `-P`）；错误信息统一走 stderr；移除 ssh 的 `2>&1`，stdout/stderr 分离；主机密钥默认 `accept-new` 并新增 `--insecure`；颜色仅在 TTY 输出；测试 runner 改用独立退出码捕获
 - **3.2**：代理工具平台感知，封装 `build_proxy_command()` 函数，macOS/Linux 使用 `nc`，Windows 使用 `connect.exe`
 - **3.1**：修复两个关键bug：路径转换使用 `$USERPROFILE`、持续输出改为实时流式输出
 - **3.0**：完全重构为 Bash 版本，使用 SSH_ASKPASS 机制，适配 MSYS2 UCRT64 环境

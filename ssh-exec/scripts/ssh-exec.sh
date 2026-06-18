@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ssh-exec.sh - SSH remote execution with automatic password input
 # Supports: SSH key + passphrase, password authentication, proxy
-# Designed for MSYS2 UCRT64 / Git Bash environment
+# Cross-platform: Windows (MSYS2/Git Bash, connect.exe) and macOS/Linux (nc)
 
 set -eo pipefail
 
 # Default values
 SERVER=""
-USER=""
+SSH_USER=""
 COMMAND=""
 PORT=22
 AUTH_METHOD="key"
@@ -16,12 +16,16 @@ PASSWORD=""
 PROXY=""
 PROXY_TYPE="socks5"
 TIMEOUT=30
+INSECURE=false
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+# Colors (only when stderr is a terminal, so redirected output stays clean)
+if [[ -t 2 ]]; then
+    RED='\033[0;31m'
+    NC='\033[0m'
+else
+    RED=''
+    NC=''
+fi
 
 # Help message
 usage() {
@@ -42,6 +46,8 @@ Optional:
   -P, --password PASS      Password or key passphrase
       --proxy ADDR         Proxy address (format: host:port)
       --proxy-type TYPE    Proxy type: socks5 or http (default: socks5)
+      --insecure           Disable host key checking (StrictHostKeyChecking=no).
+                           Default verifies via accept-new + ~/.ssh/known_hosts.
   -t, --timeout SECONDS    Connection timeout (default: 30)
   -h, --help               Show this help message
 
@@ -102,7 +108,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -u|--user)
             validate_arg "$1" "$2"
-            USER="$2"
+            SSH_USER="$2"
             shift 2
             ;;
         -c|--command)
@@ -140,6 +146,10 @@ while [[ $# -gt 0 ]]; do
             PROXY_TYPE="$2"
             shift 2
             ;;
+        --insecure)
+            INSECURE=true
+            shift
+            ;;
         -t|--timeout)
             validate_arg "$1" "$2"
             TIMEOUT="$2"
@@ -150,38 +160,50 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            echo -e "${RED}Error: Unknown option: $1${NC}"
-            usage
+            echo -e "${RED}Error: Unknown option: $1${NC}" >&2
+            usage >&2
             exit 1
             ;;
     esac
 done
 
 # Validate required parameters
-if [[ -z "$SERVER" || -z "$USER" || -z "$COMMAND" ]]; then
-    echo -e "${RED}Error: Missing required parameters${NC}"
-    usage
+if [[ -z "$SERVER" || -z "$SSH_USER" || -z "$COMMAND" ]]; then
+    echo -e "${RED}Error: Missing required parameters${NC}" >&2
+    usage >&2
     exit 1
 fi
 
 if [[ "$AUTH_METHOD" != "key" && "$AUTH_METHOD" != "password" ]]; then
-    echo -e "${RED}Error: Invalid auth method. Use 'key' or 'password'${NC}"
+    echo -e "${RED}Error: Invalid auth method. Use 'key' or 'password'${NC}" >&2
     exit 1
 fi
 
 if [[ "$AUTH_METHOD" == "key" && -z "$KEY_PATH" ]]; then
-    echo -e "${RED}Error: -k/--key is required when using key authentication${NC}"
+    echo -e "${RED}Error: -k/--key is required when using key authentication${NC}" >&2
+    exit 1
+fi
+
+if [[ "$AUTH_METHOD" == "key" && ! -r "$KEY_PATH" ]]; then
+    echo -e "${RED}Error: SSH key not found or not readable: $KEY_PATH${NC}" >&2
     exit 1
 fi
 
 # Build SSH options
 SSH_OPTS=(
-    -o "StrictHostKeyChecking=no"
-    -o "UserKnownHostsFile=/dev/null"
     -o "LogLevel=ERROR"
     -o "ConnectTimeout=$TIMEOUT"
     -p "$PORT"
 )
+
+# Host key verification: secure by default (accept-new records the key on first
+# use via ~/.ssh/known_hosts, then fails on change). --insecure restores the old
+# throwaway behavior for ephemeral/CI hosts.
+if [[ "$INSECURE" == true ]]; then
+    SSH_OPTS+=(-o "StrictHostKeyChecking=no" -o "UserKnownHostsFile=/dev/null")
+else
+    SSH_OPTS+=(-o "StrictHostKeyChecking=accept-new")
+fi
 
 if [[ -n "$PROXY" ]]; then
     proxy_cmd=$(build_proxy_command "$PROXY" "$PROXY_TYPE") || exit 1
@@ -205,26 +227,21 @@ trap cleanup EXIT
 # Execute SSH with askpass
 execute_ssh() {
     local ssh_args=("${SSH_OPTS[@]}")
-    
+
     if [[ "$AUTH_METHOD" == "key" ]]; then
-        # Key authentication
-        if [[ ! -f "$KEY_PATH" ]]; then
-            echo -e "${RED}Error: SSH key not found: $KEY_PATH${NC}"
-            exit 1
-        fi
         ssh_args+=(-o "IdentityFile=$KEY_PATH")
     fi
-    
-    ssh_args+=("${USER}@${SERVER}")
+
+    ssh_args+=("${SSH_USER}@${SERVER}")
     ssh_args+=("$COMMAND")
-    
+
     # Set up askpass environment
     export SSH_ASKPASS="$ASKPASS_SCRIPT"
     export SSH_ASKPASS_PASSWORD="$PASSWORD"
     export SSH_ASKPASS_REQUIRE="force"
     export DISPLAY="dummy:0"
-    
-    ssh "${ssh_args[@]}" 2>&1
+
+    ssh "${ssh_args[@]}"
 }
 
 # Main execution
@@ -234,9 +251,9 @@ if [[ -z "$PASSWORD" ]]; then
         # Key without passphrase
         local_no_pass_opts=("${SSH_OPTS[@]}")
         local_no_pass_opts+=(-o "IdentityFile=$KEY_PATH")
-        local_no_pass_opts+=("${USER}@${SERVER}")
+        local_no_pass_opts+=("${SSH_USER}@${SERVER}")
         local_no_pass_opts+=("$COMMAND")
-        ssh "${local_no_pass_opts[@]}" 2>&1
+        ssh "${local_no_pass_opts[@]}"
     else
         echo -e "${RED}Error: Password required for password authentication${NC}" >&2
         exit 1

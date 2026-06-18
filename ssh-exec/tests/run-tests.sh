@@ -41,10 +41,17 @@ fail() {
     FAILED_TESTS+=("$3")
 }
 skip() { echo -e "  ${COLOR_YELLOW}⏭ SKIP${COLOR_NC} (reason: $1)"; ((SKIP+=1)); }
+
+# run sets LAST_OUTPUT (combined stdout+stderr) and LAST_EXIT (exit code).
+# Capturing the exit code separately is robust regardless of the command's
+# output content (the old approach parsed the last output line as the code).
+LAST_OUTPUT=""
+LAST_EXIT=0
 run() {
-    local exit_code=0
-    bash "$SKILL" "$@" 2>&1 || exit_code=$?
-    echo "$exit_code"
+    set +e
+    LAST_OUTPUT="$(bash "$SKILL" "$@" 2>&1)"
+    LAST_EXIT=$?
+    set -e
 }
 
 echo "============================================"
@@ -61,143 +68,137 @@ echo "=== Group 1: Parameter Validation ==="
 
 # T1.1
 echo -n "T1.1  缺少 -s ..."
-output=$(run -u root -c "hostname" -P "test")
-exit_code=${output##*$'\n'}
-output=${output%$'\n'*}
-if [[ "$exit_code" != "0" ]] && echo "$output" | grep -q "Error: Missing required parameters"; then
+run -u root -c "hostname" -P "test"
+if [[ "$LAST_EXIT" != "0" ]] && echo "$LAST_OUTPUT" | grep -q "Error: Missing required parameters"; then
     pass
 else
-    fail "EXIT != 0 + 'Missing required parameters'" "EXIT=$exit_code" "T1.1"
+    fail "EXIT != 0 + 'Missing required parameters'" "EXIT=$LAST_EXIT" "T1.1"
 fi
 
 # T1.2
 echo -n "T1.2  缺少 -u ..."
-output=$(run -s 10.0.0.1 -c "hostname" -P "test")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" != "0" ]]; then
+run -s 10.0.0.1 -c "hostname" -P "test"
+if [[ "$LAST_EXIT" != "0" ]]; then
     pass
 else
-    fail "EXIT != 0" "EXIT=$exit_code" "T1.2"
+    fail "EXIT != 0" "EXIT=$LAST_EXIT" "T1.2"
 fi
 
 # T1.3
 echo -n "T1.3  缺少 -c ..."
-output=$(run -s 10.0.0.1 -u root -P "test")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" != "0" ]]; then
+run -s 10.0.0.1 -u root -P "test"
+if [[ "$LAST_EXIT" != "0" ]]; then
     pass
 else
-    fail "EXIT != 0" "EXIT=$exit_code" "T1.3"
+    fail "EXIT != 0" "EXIT=$LAST_EXIT" "T1.3"
 fi
 
 # T1.4
 echo -n "T1.4  -s 无值 ..."
-output=$(run -s -u root -c "hostname" -P "test")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "1" ]] && echo "$output" | grep -q "Error: -s requires a value"; then
+run -s -u root -c "hostname" -P "test"
+if [[ "$LAST_EXIT" == "1" ]] && echo "$LAST_OUTPUT" | grep -q "Error: -s requires a value"; then
     pass
 else
-    fail "-s requires a value + EXIT=1" "EXIT=$exit_code" "T1.4"
+    fail "-s requires a value + EXIT=1" "EXIT=$LAST_EXIT" "T1.4"
 fi
 
 # T1.5
 echo -n "T1.5  -u 无值 ..."
-output=$(run -s 10.0.0.1 -u -c "hostname" -P "test")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "1" ]] && echo "$output" | grep -q "Error: -u requires a value"; then
+run -s 10.0.0.1 -u -c "hostname" -P "test"
+if [[ "$LAST_EXIT" == "1" ]] && echo "$LAST_OUTPUT" | grep -q "Error: -u requires a value"; then
     pass
 else
-    fail "-u requires a value + EXIT=1" "EXIT=$exit_code" "T1.5"
+    fail "-u requires a value + EXIT=1" "EXIT=$LAST_EXIT" "T1.5"
 fi
 
 # T1.6
 echo -n "T1.6  -c 无值 ..."
-output=$(run -s 10.0.0.1 -u root -c -P "test")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "1" ]] && echo "$output" | grep -q "Error: -c requires a value"; then
+run -s 10.0.0.1 -u root -c -P "test"
+if [[ "$LAST_EXIT" == "1" ]] && echo "$LAST_OUTPUT" | grep -q "Error: -c requires a value"; then
     pass
 else
-    fail "-c requires a value + EXIT=1" "EXIT=$exit_code" "T1.6"
+    fail "-c requires a value + EXIT=1" "EXIT=$LAST_EXIT" "T1.6"
 fi
 
 # T1.7
 echo -n "T1.7  -P 无值 ..."
-output=$(run -s 10.0.0.1 -u root -c "hostname" -P)
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "1" ]] && echo "$output" | grep -q "Error: -P requires a value"; then
+run -s 10.0.0.1 -u root -c "hostname" -P
+if [[ "$LAST_EXIT" == "1" ]] && echo "$LAST_OUTPUT" | grep -q "Error: -P requires a value"; then
     pass
 else
-    fail "-P requires a value + EXIT=1" "EXIT=$exit_code" "T1.7"
+    fail "-P requires a value + EXIT=1" "EXIT=$LAST_EXIT" "T1.7"
 fi
 
 # T1.8
 echo -n "T1.8  -a key 缺 -k ..."
-output=$(run -s 10.0.0.1 -u root -a key -c "hostname" -P "test")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "1" ]] && echo "$output" | grep -q "Error: -k/--key is required"; then
+run -s 10.0.0.1 -u root -a key -c "hostname" -P "test"
+if [[ "$LAST_EXIT" == "1" ]] && echo "$LAST_OUTPUT" | grep -q "Error: -k/--key is required"; then
     pass
 else
-    fail "-k required + EXIT=1" "EXIT=$exit_code" "T1.8"
+    fail "-k required + EXIT=1" "EXIT=$LAST_EXIT" "T1.8"
 fi
 
 # T1.9
 echo -n "T1.9  非法 -a cert ..."
-output=$(run -s 10.0.0.1 -u root -a cert -c "hostname" -P "test" -k /tmp/key)
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "1" ]] && echo "$output" | grep -q "Invalid auth method"; then
+run -s 10.0.0.1 -u root -a cert -c "hostname" -P "test" -k /tmp/key
+if [[ "$LAST_EXIT" == "1" ]] && echo "$LAST_OUTPUT" | grep -q "Invalid auth method"; then
     pass
 else
-    fail "Invalid auth method + EXIT=1" "EXIT=$exit_code" "T1.9"
+    fail "Invalid auth method + EXIT=1" "EXIT=$LAST_EXIT" "T1.9"
 fi
 
 # T1.10
 echo -n "T1.10 未知选项 --foo ..."
-output=$(run -s 10.0.0.1 -u root -c "hostname" -P "test" --foo)
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "1" ]] && echo "$output" | grep -q "Error: Unknown option: --foo"; then
+run -s 10.0.0.1 -u root -c "hostname" -P "test" --foo
+if [[ "$LAST_EXIT" == "1" ]] && echo "$LAST_OUTPUT" | grep -q "Error: Unknown option: --foo"; then
     pass
 else
-    fail "Unknown option + EXIT=1" "EXIT=$exit_code" "T1.10"
+    fail "Unknown option + EXIT=1" "EXIT=$LAST_EXIT" "T1.10"
 fi
 
 # T1.11
 echo -n "T1.11 -p 无值 ..."
-output=$(run -s 10.0.0.1 -u root -p -c "hostname" -P "test")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "1" ]] && echo "$output" | grep -q "Error: -p requires a value"; then
+run -s 10.0.0.1 -u root -p -c "hostname" -P "test"
+if [[ "$LAST_EXIT" == "1" ]] && echo "$LAST_OUTPUT" | grep -q "Error: -p requires a value"; then
     pass
 else
-    fail "-p requires a value + EXIT=1" "EXIT=$exit_code" "T1.11"
+    fail "-p requires a value + EXIT=1" "EXIT=$LAST_EXIT" "T1.11"
 fi
 
 # T1.12
 echo -n "T1.12 --proxy 无值 ..."
-output=$(run -s 10.0.0.1 -u root -c "hostname" -P "test" --proxy)
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "1" ]] && echo "$output" | grep -q "Error: --proxy requires a value"; then
+run -s 10.0.0.1 -u root -c "hostname" -P "test" --proxy
+if [[ "$LAST_EXIT" == "1" ]] && echo "$LAST_OUTPUT" | grep -q "Error: --proxy requires a value"; then
     pass
 else
-    fail "--proxy requires a value + EXIT=1" "EXIT=$exit_code" "T1.12"
+    fail "--proxy requires a value + EXIT=1" "EXIT=$LAST_EXIT" "T1.12"
 fi
 
 # T1.13
 echo -n "T1.13 -k 无值 ..."
-output=$(run -s 10.0.0.1 -u root -a key -k -c "hostname" -P "test")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "1" ]] && echo "$output" | grep -q "Error: -k requires a value"; then
+run -s 10.0.0.1 -u root -a key -k -c "hostname" -P "test"
+if [[ "$LAST_EXIT" == "1" ]] && echo "$LAST_OUTPUT" | grep -q "Error: -k requires a value"; then
     pass
 else
-    fail "-k requires a value + EXIT=1" "EXIT=$exit_code" "T1.13"
+    fail "-k requires a value + EXIT=1" "EXIT=$LAST_EXIT" "T1.13"
 fi
 
 # T1.14
 echo -n "T1.14 -h 帮助 ..."
-output=$(run -h)
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "0" ]] && echo "$output" | grep -q "Usage:"; then
+run -h
+if [[ "$LAST_EXIT" == "0" ]] && echo "$LAST_OUTPUT" | grep -q "Usage:"; then
     pass
 else
-    fail "Usage + EXIT=0" "EXIT=$exit_code" "T1.14"
+    fail "Usage + EXIT=0" "EXIT=$LAST_EXIT" "T1.14"
+fi
+
+# T1.15
+echo -n "T1.15 密钥文件不存在 ..."
+run -s 10.0.0.1 -u root -a key -k /nonexistent/key_xyz -c "hostname" -P "test"
+if [[ "$LAST_EXIT" == "1" ]] && echo "$LAST_OUTPUT" | grep -q "Error: SSH key not found or not readable"; then
+    pass
+else
+    fail "SSH key not found + EXIT=1" "EXIT=$LAST_EXIT" "T1.15"
 fi
 
 if [[ "$QUICK_MODE" == true ]]; then
@@ -215,62 +216,56 @@ BASE_ARGS=(-s "$SERVER" -p "$PORT" -u "$USER" -a key -k "$KEY_PATH" -P "$PASSWOR
 
 # T2.1
 echo -n "T2.1  hostname ..."
-output=$(run "${BASE_ARGS[@]}" -c "hostname")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "0" ]]; then
+run "${BASE_ARGS[@]}" -c "hostname"
+if [[ "$LAST_EXIT" == "0" ]]; then
     pass
 else
-    fail "EXIT=0" "EXIT=$exit_code" "T2.1"
+    fail "EXIT=0" "EXIT=$LAST_EXIT" "T2.1"
 fi
 
 # T2.2
 echo -n "T2.2  whoami ..."
-output=$(run "${BASE_ARGS[@]}" -c "whoami")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "0" ]] && echo "$output" | grep -q "root"; then
+run "${BASE_ARGS[@]}" -c "whoami"
+if [[ "$LAST_EXIT" == "0" ]] && echo "$LAST_OUTPUT" | grep -q "root"; then
     pass
 else
-    fail "root + EXIT=0" "EXIT=$exit_code" "T2.2"
+    fail "root + EXIT=0" "EXIT=$LAST_EXIT" "T2.2"
 fi
 
 # T2.3
 echo -n "T2.3  uptime ..."
-output=$(run "${BASE_ARGS[@]}" -c "uptime")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "0" ]]; then
+run "${BASE_ARGS[@]}" -c "uptime"
+if [[ "$LAST_EXIT" == "0" ]]; then
     pass
 else
-    fail "EXIT=0" "EXIT=$exit_code" "T2.3"
+    fail "EXIT=0" "EXIT=$LAST_EXIT" "T2.3"
 fi
 
 # T2.4
 echo -n "T2.4  ls -la /root | head -5 ..."
-output=$(run "${BASE_ARGS[@]}" -c "ls -la /root | head -5")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "0" ]]; then
+run "${BASE_ARGS[@]}" -c "ls -la /root | head -5"
+if [[ "$LAST_EXIT" == "0" ]]; then
     pass
 else
-    fail "EXIT=0" "EXIT=$exit_code" "T2.4"
+    fail "EXIT=0" "EXIT=$LAST_EXIT" "T2.4"
 fi
 
 # T2.5
 echo -n "T2.5  exit 42 ..."
-output=$(run "${BASE_ARGS[@]}" -c "exit 42")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "42" ]]; then
+run "${BASE_ARGS[@]}" -c "exit 42"
+if [[ "$LAST_EXIT" == "42" ]]; then
     pass
 else
-    fail "EXIT=42" "EXIT=$exit_code" "T2.5"
+    fail "EXIT=42" "EXIT=$LAST_EXIT" "T2.5"
 fi
 
 # T2.6
 echo -n "T2.6  nonexistent-command ..."
-output=$(run "${BASE_ARGS[@]}" -c "nonexistent_command_xyz")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "127" ]]; then
+run "${BASE_ARGS[@]}" -c "nonexistent_command_xyz"
+if [[ "$LAST_EXIT" == "127" ]]; then
     pass
 else
-    fail "EXIT=127" "EXIT=$exit_code" "T2.6"
+    fail "EXIT=127" "EXIT=$LAST_EXIT" "T2.6"
 fi
 
 # ============================================================
@@ -281,22 +276,20 @@ echo "=== Group 3: Proxy Tests ==="
 
 # T3.1
 echo -n "T3.1  SOCKS5 proxy ..."
-output=$(run -s "$SERVER" -p "$PORT" -u "$USER" -a key -k "$KEY_PATH" -P "$PASSWORD" --proxy "$SOCKS_PROXY" --proxy-type socks5 -c "hostname")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "0" ]]; then
+run -s "$SERVER" -p "$PORT" -u "$USER" -a key -k "$KEY_PATH" -P "$PASSWORD" --proxy "$SOCKS_PROXY" --proxy-type socks5 -c "hostname"
+if [[ "$LAST_EXIT" == "0" ]]; then
     pass
 else
-    fail "EXIT=0 via SOCKS5" "EXIT=$exit_code" "T3.1"
+    fail "EXIT=0 via SOCKS5" "EXIT=$LAST_EXIT" "T3.1"
 fi
 
 # T3.2
 echo -n "T3.2  HTTP proxy ..."
-output=$(run -s "$SERVER" -p "$PORT" -u "$USER" -a key -k "$KEY_PATH" -P "$PASSWORD" --proxy "$HTTP_PROXY" --proxy-type http -c "hostname")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "0" ]]; then
+run -s "$SERVER" -p "$PORT" -u "$USER" -a key -k "$KEY_PATH" -P "$PASSWORD" --proxy "$HTTP_PROXY" --proxy-type http -c "hostname"
+if [[ "$LAST_EXIT" == "0" ]]; then
     pass
 else
-    fail "EXIT=0 via HTTP" "EXIT=$exit_code" "T3.2"
+    fail "EXIT=0 via HTTP" "EXIT=$LAST_EXIT" "T3.2"
 fi
 
 # ============================================================
@@ -307,72 +300,65 @@ echo "=== Group 4: Edge Cases ==="
 
 # T4.1
 echo -n "T4.1  密码含特殊字符 ..."
-output=$(run -s "$SERVER" -p "$PORT" -u "$USER" -a key -k "$KEY_PATH" -P "$PASSWORD" --proxy "$SOCKS_PROXY" -c "echo 'special chars OK'")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "0" ]]; then
+run -s "$SERVER" -p "$PORT" -u "$USER" -a key -k "$KEY_PATH" -P "$PASSWORD" --proxy "$SOCKS_PROXY" -c "echo 'special chars OK'"
+if [[ "$LAST_EXIT" == "0" ]]; then
     pass
 else
-    fail "EXIT=0 with special chars password" "EXIT=$exit_code" "T4.1"
+    fail "EXIT=0 with special chars password" "EXIT=$LAST_EXIT" "T4.1"
 fi
 
 # T4.2
 echo -n "T4.2  长管道命令 ..."
-output=$(run "${BASE_ARGS[@]}" -c "echo A && echo B && echo C && uname -a")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "0" ]]; then
+run "${BASE_ARGS[@]}" -c "echo A && echo B && echo C && uname -a"
+if [[ "$LAST_EXIT" == "0" ]]; then
     pass
 else
-    fail "EXIT=0" "EXIT=$exit_code" "T4.2"
+    fail "EXIT=0" "EXIT=$LAST_EXIT" "T4.2"
 fi
 
 # T4.3
 echo -n "T4.3  stderr 混合输出 ..."
-output=$(run "${BASE_ARGS[@]}" -c "echo stdout; echo stderr >&2")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "0" ]]; then
+run "${BASE_ARGS[@]}" -c "echo stdout; echo stderr >&2"
+if [[ "$LAST_EXIT" == "0" ]]; then
     pass
 else
-    fail "EXIT=0" "EXIT=$exit_code" "T4.3"
+    fail "EXIT=0" "EXIT=$LAST_EXIT" "T4.3"
 fi
 
 # T4.4
 echo -n "T4.4  密钥无密码短语 ..."
-output=$(run -s "$SERVER" -p "$PORT" -u "$USER" -a key -k "$KEY_PATH" --proxy "$SOCKS_PROXY" -c "hostname")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "255" ]]; then
+run -s "$SERVER" -p "$PORT" -u "$USER" -a key -k "$KEY_PATH" --proxy "$SOCKS_PROXY" -c "hostname"
+if [[ "$LAST_EXIT" == "255" ]]; then
     pass
 else
-    fail "EXIT=255 (Permission denied)" "EXIT=$exit_code" "T4.4"
+    fail "EXIT=255 (Permission denied)" "EXIT=$LAST_EXIT" "T4.4"
 fi
 
 # T4.5
 echo -n "T4.5  完整密钥路径 ..."
-output=$(run "${BASE_ARGS[@]}" -c "date +%Y")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "0" ]]; then
+run "${BASE_ARGS[@]}" -c "date +%Y"
+if [[ "$LAST_EXIT" == "0" ]]; then
     pass
 else
-    fail "EXIT=0" "EXIT=$exit_code" "T4.5"
+    fail "EXIT=0" "EXIT=$LAST_EXIT" "T4.5"
 fi
 
 # T4.6
 echo -n "T4.6  密码认证无密码 ..."
-output=$(run -s "$SERVER" -p "$PORT" -u "$USER" -a password -c "hostname")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" == "1" ]] && echo "$output" | grep -q "Password required for password authentication"; then
+run -s "$SERVER" -p "$PORT" -u "$USER" -a password -c "hostname"
+if [[ "$LAST_EXIT" == "1" ]] && echo "$LAST_OUTPUT" | grep -q "Password required for password authentication"; then
     pass
 else
-    fail "'Password required' + EXIT=1" "EXIT=$exit_code" "T4.6"
+    fail "'Password required' + EXIT=1" "EXIT=$LAST_EXIT" "T4.6"
 fi
 
 # T4.7
 echo -n "T4.7  默认端口22（预期失败）..."
-output=$(run -s "$SERVER" -u "$USER" -a key -k "$KEY_PATH" -P "$PASSWORD" --proxy "$SOCKS_PROXY" -c "hostname")
-exit_code=${output##*$'\n'}
-if [[ "$exit_code" != "0" ]]; then
+run -s "$SERVER" -u "$USER" -a key -k "$KEY_PATH" -P "$PASSWORD" --proxy "$SOCKS_PROXY" -c "hostname"
+if [[ "$LAST_EXIT" != "0" ]]; then
     pass
 else
-    fail "EXIT != 0 (port 22 fails)" "EXIT=$exit_code" "T4.7"
+    fail "EXIT != 0 (port 22 fails)" "EXIT=$LAST_EXIT" "T4.7"
 fi
 
 fi
