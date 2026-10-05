@@ -29,7 +29,7 @@ agent-skills/
 | [bitwarden-skill](./bitwarden-skill/) | 0.5.0 | 通过 bw.sh 脚本对 Bitwarden/Vaultwarden 密码库条目进行增删改查 |
 | [ssh-exec](./ssh-exec/) | 0.7 | SSH 远程命令执行，支持密钥和密码认证 |
 | [web-access](./web-access/) | 0.1.0 | Brave 网络搜索（支持日期筛选）+ 任意网页正文提取为 Markdown |
-| [obsidian-fastnotesync-skill](./obsidian-fastnotesync-skill/) | 1.1.0 | 通过 Fast Note Sync Service REST API 对远程 Obsidian 笔记进行增删改查 |
+| [obsidian-fastnotesync-skill](./obsidian-fastnotesync-skill/) | 2.0.0 | 通过 scripts/fns.sh（Bash 3.2+、curl、jq、iconv）操作远程 Obsidian 笔记、发现保险库并诊断服务，默认使用令牌认证，遵循固定版本的 Fast Note Sync REST 契约 |
 | [obsidian-livesync-skill](./obsidian-livesync-skill/) | 1.4.0 | 对 Obsidian LiveSync CouchDB 数据库进行增删改查 |
 
 ## Skill 格式
