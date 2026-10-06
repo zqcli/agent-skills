@@ -1,4 +1,4 @@
-# FastNoteSync 2.0.0 API Contract
+# FastNoteSync 2.0.1 API Contract
 
 ## Frozen source and authority
 
@@ -9,10 +9,11 @@ This contract targets the official `haierkeys/fast-note-sync-service` repository
 | Upstream tag | `3.6.1` |
 | Commit | `7a6c78792c631f999c8a5f725bba5dd7235d6688` |
 | Release publication | August 14, 2026 (`2026-08-14T17:15:46Z`) |
-| Skill version | `2.0.0` |
-| CLI entry point | `scripts/fns.sh`, relative to the skill directory |
-| Runtime | Bash 3.2+, curl, jq, standard Unix iconv, and standard shell utilities |
-| Test runtime | Python 3.8+ standard library (`unittest`); no Python runtime dependency |
+| Skill version | `2.0.1` |
+| CLI entry point | `python3 scripts/fns.py`, relative to the skill directory |
+| Legacy entry point | `scripts/fns.sh`, a thin Python launcher requiring POSIX `sh`, not a separate transport |
+| Runtime | Python 3.10+ on POSIX (macOS/Linux), `requests[socks]>=2.34.2,<3`, `urllib3>=2.8.0,<3` |
+| Test runtime | Same Python/Requests/PySocks environment; standard library test framework |
 
 The [official release][release] and [release metadata][release-api] identify the
 pin. All implementation links below use the full commit, not a moving branch.
@@ -23,7 +24,22 @@ Do not assume a different server version implements the same behavior.
 There are two distinct layers: the script interface described in `SKILL.md`,
 and the pinned REST behavior below. CLI input validation, update prechecks,
 credential redaction, and recycle confirmations are script safeguards, not
-extra guarantees provided by the server.
+extra guarantees provided by the server. The upstream pin is unchanged by the
+Python transport refactor. Networking uses Requests/PySocks directly, with no
+runtime SDK or Bash/curl/jq/iconv dependency for the Python entry point.
+
+Install all dependencies from skill-root `requirements.txt` using Python 3.10+.
+The urllib3 minimum supports independent HTTPS-proxy certificate policy for HTTP
+destinations; no separate manual networking-library install is needed:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+. .venv/bin/activate
+```
+
+Use the activated `python3` or `.venv/bin/python` for commands and tests. The
+[Requests release metadata][requests-release] declares Python 3.10+ support.
 
 ## Configuration, authentication, and transport
 
@@ -38,11 +54,16 @@ require an existing vault; discovery does not require a selected vault.
 | `FNS_TOKEN` | Required for authenticated token-mode commands; never implicit password fallback. |
 | `FNS_USERNAME`, `FNS_PASSWORD` | Required only for explicit password compatibility mode. |
 | `FNS_CLIENT` | Defaults to `obsidian-fastnotesync-skill`; token-mode `x-client`. |
-| `FNS_USER_AGENT` | Defaults to `obsidian-fastnotesync-skill/2.0.0`; stable across requests. |
-| `FNS_PROXY` | Optional native curl proxy URL using `socks5`, `socks5h`, `http`, or `https`; authenticated URLs are supported via environment and private curl config only. |
-| `FNS_TIMEOUT` | Defaults to 30 seconds per request. |
-| `FNS_CONNECT_TIMEOUT` | Defaults to 10 seconds per connection attempt. |
+| `FNS_USER_AGENT` | Defaults to `obsidian-fastnotesync-skill/2.0.1`; stable across requests. |
+| `FNS_PROXY` | Optional HTTP/HTTPS/SOCKS URL using `socks5`, `socks5h`, `http`, or `https`; authentication userinfo is supported through the environment only. |
+| `FNS_TIMEOUT` | Defaults to 30 seconds total wall-clock time per request, enforced with POSIX `SIGALRM`, not Requests' inactivity timeout. |
+| `FNS_CONNECT_TIMEOUT` | Defaults to 10 seconds as an additional connection cap, within the total deadline. |
 | `FNS_ALLOW_HTTP` | Exactly `1` is required for non-loopback plain HTTP. HTTPS is preferred. |
+
+The default User-Agent changes from `obsidian-fastnotesync-skill/2.0.0` to
+`obsidian-fastnotesync-skill/2.0.1`. For a manual token bound to the old default,
+securely configure non-secret `FNS_USER_AGENT='obsidian-fastnotesync-skill/2.0.0'`
+to reuse it, or provision a new token externally. Never auto-rotate credentials.
 
 Protected requests use an `Authorization: Bearer` header. Although upstream can
 extract a token from other headers or a query, this CLI must not put service
@@ -50,13 +71,12 @@ tokens or login credentials in URLs. Supply secrets through a trusted
 environment/secret manager only, never through CLI arguments or inline shell
 assignments; never ask users to paste secrets or show raw credentials.
 `FNS_BASE_URL` must not contain credentials, username/password userinfo, secret
-query parameters, or URL-glob expressions in its authority. Curl URL globbing is
-disabled (`globoff`) for requests. **`FNS_PROXY` does accept proxy authentication userinfo** in
-native HTTP/HTTPS/SOCKS URLs. Provision authenticated proxy URLs through the
-environment only and write their value to the private curl config, never a
-`--proxy` process argument. Keep proxy credentials and authenticated URLs out
-of shell history, examples, logs, diagnostics, and error messages. Do not disable
-TLS verification. HTTP opt-in does not encrypt data.
+query parameters, or URL-glob expressions in its authority. Requests does not
+perform curl URL globbing. **`FNS_PROXY` accepts proxy authentication userinfo**
+in HTTP/HTTPS/SOCKS URLs, through the environment only. Keep proxy credentials
+and authenticated URLs in memory, never process arguments, sensitive files,
+shell history, examples, logs, diagnostics, or error messages. HTTP opt-in does
+not encrypt data.
 
 Password compatibility login is `POST /api/user/login`, with `credentials`
 (from `FNS_USERNAME`) and `password` in a JSON body. Login and every subsequent
@@ -67,26 +87,36 @@ requests. Setting a WebGUI header on a manual token does not grant WebGUI-only
 management access. See [routes][routes], [login handler][login-handler],
 [login DTO][login-dto], [token authentication][auth], and [WebGUI gate][webgui].
 
-No token cache, automatic refresh, failure-triggered re-login, or automatic retry
-is permitted. A compatibility login token is used only within that invocation;
-any private curl-config files are temporary and cleaned up, not a persistent
-cache. Expired or rejected tokens are reported without a hidden second attempt.
-`doctor` probes only public health and version, not protected access.
+No persistent token cache, automatic refresh, failure-triggered re-login, or
+retry is permitted. A compatibility login token lasts only for that invocation.
+No tokens, login payloads, or sensitive transport files are persisted. Requests
+handles structured query parameters and JSON directly, not subprocess curl.
+No logging/tracing or redirect following; do not enable shell tracing or HTTP
+debug logs. Error messages are generic to prevent upstream echo leaks. Normal
+JSON output and diagnostics redact known credentials; see the response contract.
+`doctor` probes public health and version, not protected access.
 
-Curl must read secret headers, authenticated proxy configuration, and login-body
-files via a config in a private temporary directory: `umask 077`, directory mode
-700, file mode 600, and cleanup on exit. Secret contents must not appear in
-curl/jq arguments. No shell tracing, curl verbose/trace output, redirect
-following, or automatic retry. Error messages are intentionally generic to
-prevent upstream or curl echo leaks. Normal JSON output and diagnostics redact
-known credentials and authenticated proxy URLs, including success payloads;
-see the response contract below.
+Set `Session.trust_env=False` to disable `.netrc` authentication that could
+clobber Bearer headers; [Requests documents this override][requests-auth]. When
+`FNS_PROXY` is unset, manually select standard environment proxies with
+`requests.utils.get_environ_proxies`, respecting their bypass rules. An explicit
+`FNS_PROXY` maps both HTTP and HTTPS requests to that proxy, overriding inherited
+proxies and `NO_PROXY` / `no_proxy`. HTTP/HTTPS authenticated proxies are
+supported; PySocks uses local DNS for `socks5` and proxy DNS for `socks5h`.
+HTTP/HTTPS proxy Basic auth percent-decodes userinfo to bytes before Base64,
+preserving UTF-8 credential bytes instead of Requests' Latin-1 default.
 
-Proxy configuration is one native curl value, not shell-split; `socks5` resolves
-destination DNS locally and `socks5h` through the proxy. When `FNS_PROXY` is set,
-the private curl config sets `noproxy` to an empty string, forcing routing through
-the explicit proxy and overriding inherited `NO_PROXY` / `no_proxy` exclusions.
-When `FNS_PROXY` is unset, curl retains its native proxy-environment behavior.
+TLS verification remains enabled. Manually honor `REQUESTS_CA_BUNDLE`, then
+`CURL_CA_BUNDLE`, with certifi as the default trust store; never `verify=False`.
+The custom adapter supplies an explicit CA- and hostname-verifying
+`proxy_ssl_context` for HTTPS proxies, independent of destination certificate
+policy, including HTTP destinations. This does not encrypt the proxy-to-HTTP
+origin hop. See [urllib3 2.8 proxy TLS policy][urllib3-proxy-policy] and
+[Requests proxy/TLS documentation][requests-transport]. `FNS_TIMEOUT` covers
+proxy selection (including environment/platform lookup), request JSON
+serialization, body reading, and response JSON validation within its POSIX
+`SIGALRM` deadline, not merely Requests' inactivity timeout. The connection cap
+also applies. POSIX macOS/Linux is required; see [Python signals][python-signals].
 
 ## CLI and REST mapping
 
@@ -140,6 +170,8 @@ release; any future additions require a separate scope decision.
   `--fail-if-no-match`. Find is nonempty; an explicitly empty replacement is valid.
 - `frontmatter --path P` requires at least one of `--updates` (JSON object) or
   `--remove` (JSON array of strings); arbitrary JSON scalars are not valid.
+  Nonfinite numbers, including overflow such as `1e999`, are local usage errors
+  rejected before login or a write.
 - `rename --old-path P --path Q` supports `--old-path-hash H` and `--path-hash H`.
 - `delete --path P` and `restore --path P` operate on one note.
 - Single clearing requires `recycle-clear --path P --confirm`. Full clearing
@@ -165,12 +197,11 @@ workaround: it denotes a different filename, not transparent transport encoding.
 ### Content encoding and preservation
 
 Literal `--content`, `--content-file`, and stdin note content must be valid UTF-8.
-Standard Unix `iconv` is a required runtime dependency for validation. Invalid
-UTF-8 is rejected locally before login or any write; it is not silently replaced
-or transcoded. Valid UTF-8 input is not normalized, and input handling neither
-adds nor removes trailing newlines. This applies to the content sources for
-create/update/upsert and append/prepend; it does not promise that server-side
-YAML reserialization preserves the existing note's bytes.
+Python strictly validates UTF-8, reading files/stdin as bytes and decoding without
+newline translation. Invalid UTF-8 is rejected before login or any write, never
+silently replaced or transcoded. Valid input preserves CRLF and final newlines
+without normalization. This applies to create/update/upsert and append/prepend
+sources; server-side YAML reserialization can still change the existing note.
 
 ## Response normalization and exit contract
 
@@ -197,10 +228,11 @@ For successful replies, retain the upstream success code and credential-redacted
 payload; normalize an omitted payload to `data: null`. Redaction covers known
 tokens, usernames, passwords, authenticated proxy URLs, and proxy credential
 components, including URL-encoded and decoded forms. Apply it recursively to
-JSON string values and object keys, including success data. **Stdout redaction
-can change matching secret text in returned note content; it does not change
-content sent to or stored by the server.** Do not expose an upstream failure as
-success merely because curl completed or returned HTTP 200.
+payload string values and object keys, including success data, not client
+envelope keys. `success`, `code`, `data`, `error`, and error metadata remain stable
+even when a credential equals `data`. **Stdout redaction can change matching
+secret text in returned note content; it does not change content sent to or
+stored by the server.** HTTP 200 alone is not success.
 
 For **list/search only**, upstream's nil-slice empty result `data.list: null`
 is normalized to `[]` only when `data.pager.totalRows` is exactly `0`. Null with
@@ -379,25 +411,31 @@ CLI operations are out of scope. See [GET implementation][note-handler] and
 
 ## Verification
 
-From the repository root:
+Use Python 3.10+ with all installed `requirements.txt` dependencies. Tests use the
+standard library framework, not curl/mock-curl fixtures. From the repository root:
 
 ```bash
-bash -n obsidian-fastnotesync-skill/scripts/fns.sh
-shellcheck obsidian-fastnotesync-skill/scripts/fns.sh
+# AST compilation checks syntax without executing the script or writing pycache.
+python3 -B - <<'PY'
+import ast
+from pathlib import Path
+path = Path('obsidian-fastnotesync-skill/scripts/fns.py')
+compile(ast.parse(path.read_bytes(), filename=str(path)), str(path), 'exec')
+PY
 python3 -B -m unittest discover -s obsidian-fastnotesync-skill/tests -v
+# Optional compatibility check for the legacy launcher only:
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck obsidian-fastnotesync-skill/scripts/fns.sh
+fi
 if command -v skills-ref >/dev/null 2>&1; then
   skills-ref validate obsidian-fastnotesync-skill
 fi
 ```
 
-Runtime requires Bash 3.2+, curl, jq, and standard Unix `iconv` for UTF-8
-validation, plus standard utilities such as `cp`, `cat`, `mktemp`, `mv`, and `rm`.
-Tests require Python 3.8+ and use only its standard library; Python is not a
-runtime dependency. The `-B` test invocation prevents Python bytecode cache
-creation. Use offline/mock tests for parser, UTF-8 validation, proxy routing,
-response, secret-redaction, transport, and precondition behavior. They do not prove
-real-server concurrency guarantees or live-server compatibility. Report
-documentation, syntax/lint, unit-test, and live-test results separately.
+`-B` prevents Python bytecode cache creation. Offline/mock checks cover parser,
+UTF-8, proxies, responses, redaction, transport, and preconditions; they do not
+prove real-server concurrency guarantees or live compatibility. Report syntax,
+documentation, unit-test, and live-test results separately.
 
 ### Opt-in live runner
 
@@ -410,16 +448,18 @@ created outside this CLI. Prefer a token scoped to that vault. Manually opt in:
 python3 -B obsidian-fastnotesync-skill/tests/run_live.py --confirm-vault "$FNS_VAULT"
 ```
 
-Optional `--allow-clear` additionally opts into authorized recycle-clear tests.
-Fixture operations use current-run UUID path guards. Active fixtures and the
-vault are retained; the runner is not full teardown. Full clearing requires an
+The runner invokes `scripts/fns.py` with its current Python executable, requiring
+the same installed runtime dependencies. Optional `--allow-clear` opts into
+authorized recycle-clear tests. Fixture operations use current-run UUID path
+guards. Active fixtures and the vault are retained, not full teardown. Full
+clearing requires an
 initially empty vault and verification that every recycled path is within the
 current run's UUID scope. These checks are **not atomic**; ensure no concurrent
 writers throughout the run. Confirmation flags do not authorize other vaults.
 Never include private instance URLs, actual vault names, credentials, live note
 data, or run-specific results in this documentation.
 
-## Official sources at the frozen revision
+## Sources: frozen upstream and transport dependencies
 
 [release]: https://github.com/haierkeys/fast-note-sync-service/releases/tag/3.6.1
 [release-api]: https://api.github.com/repos/haierkeys/fast-note-sync-service/releases/tags/3.6.1
@@ -440,3 +480,8 @@ data, or run-specific results in this documentation.
 [code-implementation]: https://github.com/haierkeys/fast-note-sync-service/blob/7a6c78792c631f999c8a5f725bba5dd7235d6688/pkg/code/code.go#L323-L325
 [pagination]: https://github.com/haierkeys/fast-note-sync-service/blob/7a6c78792c631f999c8a5f725bba5dd7235d6688/pkg/app/pagination.go
 [path-validation]: https://github.com/haierkeys/fast-note-sync-service/blob/7a6c78792c631f999c8a5f725bba5dd7235d6688/pkg/util/path.go
+[requests-release]: https://pypi.org/project/requests/2.34.2/
+[requests-auth]: https://requests.readthedocs.io/en/latest/user/authentication/#netrc-authentication
+[requests-transport]: https://requests.readthedocs.io/en/latest/user/advanced/
+[python-signals]: https://docs.python.org/3.10/library/signal.html
+[urllib3-proxy-policy]: https://github.com/urllib3/urllib3/blob/2.8.0/src/urllib3/connection.py#L864-L912

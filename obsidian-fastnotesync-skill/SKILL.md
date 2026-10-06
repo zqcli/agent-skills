@@ -2,26 +2,47 @@
 name: obsidian-fastnotesync-skill
 description: >
   Manage remote Obsidian Markdown notes through the Fast Note Sync Service REST
-  API using scripts/fns.sh. Use for vault discovery, listing, path or content
+  API using scripts/fns.py. Use for vault discovery, listing, path or content
   search, reading, creating, updating, upserting, soft deletion, restoration,
   append, prepend, replacement, frontmatter edits, renaming, and recycle clearing
   without a local Obsidian installation.
 license: MIT
 compatibility: >
-  Runtime: Bash 3.2+, curl, jq, iconv, and standard Unix utilities, with network
-  access to Fast Note Sync Service. Python 3.8+ is required only for tests.
+  Requires Python 3.10+ on POSIX (macOS/Linux), requests[socks]>=2.34.2,<3,
+  urllib3>=2.8.0,<3, and network access to Fast Note Sync Service. Tests use
+  Python's standard library test framework and the same runtime dependencies.
 metadata:
   author: https://github.com/zqcli
-  version: "2.0.0"
+  version: "2.0.1"
 allowed-tools: Bash
 ---
 
 # Obsidian FastNoteSync Skill
 
-Use `scripts/fns.sh` for note operations, vault discovery, and diagnostics; do
-not construct ad hoc curl commands containing credentials. Resolve script and
-reference paths relative to this skill directory, not the caller's working
-directory. Examples below run from the skill directory.
+Use `python3 scripts/fns.py` for note operations, vault discovery, and diagnostics.
+Resolve script and reference paths relative to this skill directory, not the
+caller's working directory. Examples below run from the skill directory using
+the configured Python environment. `scripts/fns.sh` remains a thin compatible
+legacy launcher requiring POSIX `sh` and forwarding arguments to Python, not a
+separate HTTP transport.
+
+## Setup
+
+Python 3.10+ on POSIX (macOS/Linux), `requests[socks]>=2.34.2,<3`, and
+`urllib3>=2.8.0,<3` are required. The urllib3 minimum supports an independent
+HTTPS-proxy certificate policy, including requests to HTTP destinations.
+Install all dependencies together from skill-root `requirements.txt`; no
+separate manual networking-library install, Bash/curl/jq/iconv, or runtime SDK
+is required by the Python entry point. Use a virtual environment:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+. .venv/bin/activate
+```
+
+Activation makes the examples' `python3` use the installed dependencies. You may
+instead invoke `.venv/bin/python` directly. Keep secrets out of setup commands.
 
 The REST contract is frozen to official upstream tag **3.6.1**, commit
 `7a6c78792c631f999c8a5f725bba5dd7235d6688`, published **August 14, 2026**.
@@ -36,14 +57,20 @@ source links, response handling, and concurrency limitations.
 | `FNS_BASE_URL` | Required for network commands | Server base URL, without `/api`, credentials, secret query parameters, or URL-glob expressions in its authority. Prefer HTTPS. |
 | `FNS_TOKEN` | Required for authenticated commands in default token mode | Existing token supplied through a trusted environment or secret manager. |
 | `FNS_VAULT` | Required for note commands unless `--vault V` is supplied | Name of an existing vault. |
-| `FNS_PROXY` | Optional | Native curl proxy URL: `socks5://`, `socks5h://`, `http://`, or `https://`; authenticated URLs are supported through the environment and private curl config only. |
+| `FNS_PROXY` | Optional | HTTP/HTTPS/SOCKS proxy URL: `socks5://`, `socks5h://`, `http://`, or `https://`; authenticated URLs are supported through the environment only. |
 | `FNS_CLIENT` | `obsidian-fastnotesync-skill` | `x-client` in token mode; must match the token's permissions. |
-| `FNS_USER_AGENT` | `obsidian-fastnotesync-skill/2.0.0` | Stable User-Agent for every request. |
-| `FNS_TIMEOUT` | `30` | Total timeout in seconds per request. |
-| `FNS_CONNECT_TIMEOUT` | `10` | Connection timeout in seconds per request. |
+| `FNS_USER_AGENT` | `obsidian-fastnotesync-skill/2.0.1` | Stable User-Agent for every request. |
+| `FNS_TIMEOUT` | `30` | Total wall-clock deadline in seconds per request, enforced with POSIX `SIGALRM`, not an inactivity timeout. |
+| `FNS_CONNECT_TIMEOUT` | `10` | Additional cap on connection time in seconds, within the total deadline. |
 | `FNS_ALLOW_HTTP` | Unset | Must be exactly `1` to permit non-loopback plain HTTP. |
 | `FNS_AUTH_MODE` | `token` | Only explicit `password` selects compatibility login. |
 | `FNS_USERNAME` / `FNS_PASSWORD` | Required only in password mode | Login credentials provided through the environment, not command arguments. |
+
+**Upgrade compatibility:** the default User-Agent changes from
+`obsidian-fastnotesync-skill/2.0.0` to `obsidian-fastnotesync-skill/2.0.1`.
+To reuse a manual token bound to the old default, securely configure the
+non-secret `FNS_USER_AGENT='obsidian-fastnotesync-skill/2.0.0'`, or provision a
+new token externally. Never automatically rotate or replace credentials.
 
 Provision secrets outside the conversation using the user's existing secret
 manager or protected environment. **Never ask users to paste tokens or passwords.**
@@ -58,21 +85,31 @@ Non-secret configuration example; authentication is deliberately omitted:
 ```bash
 export FNS_BASE_URL='https://notes.example.com'
 export FNS_VAULT='Personal'
-export FNS_PROXY='socks5h://127.0.0.1:1080'  # Optional; curl resolves DNS remotely.
-bash scripts/fns.sh doctor
+export FNS_PROXY='socks5h://127.0.0.1:1080'  # Optional; DNS resolves through the proxy.
+python3 scripts/fns.py doctor
 ```
 
-`FNS_PROXY` accepts native authenticated HTTP/HTTPS/SOCKS proxy URLs, including
-username/password userinfo. Its value is written to a private curl config,
-never passed as a `--proxy` process argument or split into shell arguments.
-`socks5://` resolves destination DNS locally; `socks5h://` resolves it through
-the proxy. HTTP and HTTPS proxy negotiation is handled by curl.
-When `FNS_PROXY` is set, an empty curl `noproxy` setting forces routing through
-that proxy, overriding inherited `NO_PROXY` / `no_proxy` exclusions. Without
-`FNS_PROXY`, curl retains its native proxy-environment behavior.
-Loopback HTTP, such as `http://127.0.0.1:9000`, is permitted without opt-in;
-non-loopback HTTP requires `FNS_ALLOW_HTTP=1` and still exposes traffic in transit.
-Do not disable TLS verification.
+`FNS_PROXY` accepts authenticated HTTP/HTTPS/SOCKS URLs, including proxy
+username/password userinfo, through the environment only. Requests uses the
+value in memory, never a process argument or credential file. `socks5://`
+resolves destination DNS locally; `socks5h://` resolves it through the proxy.
+An explicit `FNS_PROXY` maps both HTTP and HTTPS requests to that proxy and
+overrides inherited proxy settings and `NO_PROXY` / `no_proxy` exclusions.
+Without it, the client manually selects standard environment proxies using
+`requests.utils.get_environ_proxies`, including applicable bypass rules.
+HTTP/HTTPS proxy Basic authentication percent-decodes userinfo to bytes before
+Base64 encoding, preserving UTF-8 credential bytes rather than using Requests'
+Latin-1 default.
+
+The Requests session has `trust_env=False` to disable `.netrc` authentication
+that could overwrite the Bearer header. The client separately honors
+`REQUESTS_CA_BUNDLE`, then `CURL_CA_BUNDLE`, using certifi by default with TLS
+verification always enabled; never use `verify=False`. A custom adapter supplies
+an explicit CA- and hostname-verifying `proxy_ssl_context` for HTTPS proxies,
+independent of destination TLS policy, even for HTTP destinations. This does not
+encrypt the proxy-to-HTTP-origin hop. Loopback HTTP, such as
+`http://127.0.0.1:9000`, needs no opt-in; non-loopback plain HTTP requires
+`FNS_ALLOW_HTTP=1` and still exposes traffic in transit.
 
 ### Default token mode
 
@@ -97,20 +134,25 @@ through the approved external workflow, never through chat.
 
 ### Transport and secret handling
 
-Authorization headers, password login bodies, and authenticated proxy URLs stay
-out of process arguments: curl reads a config and request-body files from a
-private temporary directory (`umask 077`, directory mode 700, files mode 600),
-cleaned up on exit. Curl URL globbing is disabled (`globoff`); URL-glob expressions
-in the base URL authority are rejected. Do not enable shell tracing (`set -x`),
-curl verbose/trace output, redirects, or automatic retries. Error messages are
-intentionally generic to prevent upstream or curl echo leaks. Normal JSON output
-and diagnostics redact known credentials and authenticated proxy URLs; see the
-output contract below.
+Requests/PySocks handles HTTP directly, with structured query parameters and
+JSON bodies, not subprocess curl. Tokens, login payloads, and proxy credentials
+stay in memory, never in process arguments, persistent caches, or sensitive
+temporary files. URL-glob expressions in the base URL authority remain rejected;
+there is no curl URL-globbing transport.
+
+No logging/tracing, redirect following, retries, automatic token refresh, or
+failure-triggered re-login. Do not enable shell tracing (`set -x`) or HTTP debug
+logs. Error messages are intentionally generic to prevent upstream echo leaks.
+Normal JSON output and diagnostics redact known credentials; see below.
+`FNS_TIMEOUT` is a POSIX `SIGALRM` wall-clock deadline for each request, including
+environment/platform proxy selection, request JSON serialization, body reading,
+and response JSON validation, not merely Requests' connect/read inactivity
+timeout. `FNS_CONNECT_TIMEOUT` additionally caps connection time.
 
 ## CLI conventions
 
 ```text
-bash scripts/fns.sh [--vault V] COMMAND [OPTIONS]
+python3 scripts/fns.py [--vault V] COMMAND [OPTIONS]
 ```
 
 `--vault V` may appear anywhere in the arguments and overrides `FNS_VAULT`.
@@ -125,10 +167,11 @@ a different filename. See the pinned validator in the API contract.
 `ctime` and `mtime` values are Unix timestamps in milliseconds.
 
 Literal `--content`, content-file, and stdin note content must be valid UTF-8.
-The script uses `iconv` to validate content and rejects invalid UTF-8 locally
-before login or any write. Valid UTF-8 input is not normalized, and trailing
-newlines are neither added nor removed by input handling. This does not imply
-byte preservation by server-side edits that reserialize YAML.
+Python strictly validates UTF-8; files/stdin are read as bytes and decoded without
+newline translation. Invalid UTF-8 is rejected before login or any write, not
+silently replaced or transcoded. Valid content retains CRLF and final newlines,
+without normalization. This does not imply byte preservation by server-side
+edits that reserialize YAML.
 
 `--help` emits unstructured text. Normal command output is JSON; consume the
 script envelope rather than assuming the raw REST envelope is unchanged.
@@ -173,9 +216,9 @@ claim results establish a content search without that server configuration.
 `searchContent` is ignored. Regex list/search and size sorting are not supported.
 
 ```bash
-bash scripts/fns.sh list --keyword 'Daily/' --page 1 --page-size 20
-bash scripts/fns.sh search --keyword 'meeting' --sort-by mtime --sort-order desc
-bash scripts/fns.sh list --vault 'Archive' --recycle
+python3 scripts/fns.py list --keyword 'Daily/' --page 1 --page-size 20
+python3 scripts/fns.py search --keyword 'meeting' --sort-by mtime --sort-order desc
+python3 scripts/fns.py list --vault 'Archive' --recycle
 ```
 
 ### Read
@@ -189,8 +232,8 @@ Read returns note content, hashes, timestamps, version, and `fileLinks` metadata
 not upload, rename, restore, or delete its embedded files.
 
 ```bash
-bash scripts/fns.sh read --path 'Daily/Entry.md'
-bash scripts/fns.sh --vault 'Archive' read --path 'Old.md' --recycle
+python3 scripts/fns.py read --path 'Daily/Entry.md'
+python3 scripts/fns.py --vault 'Archive' read --path 'Old.md' --recycle
 ```
 
 ### Create, update, and upsert
@@ -225,9 +268,9 @@ concurrent deletion. Re-read before deciding how to handle an uncertain result;
 never silently retry a write.
 
 ```bash
-bash scripts/fns.sh create --path 'Draft.md' --content ''
-bash scripts/fns.sh update --path 'Draft.md' --content-file './draft.md'
-printf '%s\n' '# Imported note' | bash scripts/fns.sh upsert --path 'Import.md' --stdin
+python3 scripts/fns.py create --path 'Draft.md' --content ''
+python3 scripts/fns.py update --path 'Draft.md' --content-file './draft.md'
+printf '%s\n' '# Imported note' | python3 scripts/fns.py upsert --path 'Import.md' --stdin
 ```
 
 ### Specialized edits
@@ -245,6 +288,8 @@ specialized endpoints require nonempty content and reject empty text with `305`;
 empty full-note writes remain valid via create/update/upsert.
 Frontmatter requires at least one of `--updates` (a JSON object) or `--remove`
 (a JSON array of strings); build structured JSON, not interpolated shell text.
+Nonfinite JSON numbers, including overflow such as `1e999`, are rejected locally
+as usage errors before login or a write.
 
 These endpoints perform server-side **read-modify-write, not atomic edits**;
 concurrent changes can be lost. Append adds text literally, without an automatic
@@ -262,11 +307,11 @@ Invalid regex returns `443`. `matchCount` counts matches found, not necessarily
 the number replaced.
 
 ```bash
-printf '\n## Update\nReviewed.\n' | bash scripts/fns.sh append --path 'Daily/Entry.md' --stdin
-bash scripts/fns.sh prepend --path 'Daily/Entry.md' --content 'Summary: '
-bash scripts/fns.sh replace --path 'Log.md' --find 'old phrase' --replace 'new phrase' --all
-bash scripts/fns.sh replace --path 'Log.md' --find '(item)' --replace '${1}-done' --regex --all
-bash scripts/fns.sh frontmatter --path 'Project.md' --updates '{"status":"done"}' --remove '["draft"]'
+printf '\n## Update\nReviewed.\n' | python3 scripts/fns.py append --path 'Daily/Entry.md' --stdin
+python3 scripts/fns.py prepend --path 'Daily/Entry.md' --content 'Summary: '
+python3 scripts/fns.py replace --path 'Log.md' --find 'old phrase' --replace 'new phrase' --all
+python3 scripts/fns.py replace --path 'Log.md' --find '(item)' --replace '${1}-done' --regex --all
+python3 scripts/fns.py frontmatter --path 'Project.md' --updates '{"status":"done"}' --remove '["draft"]'
 ```
 
 ### Rename, delete, restore, and recycle clearing
@@ -293,12 +338,12 @@ Full-clear requests leave both `path` and `pathHash` empty. Do not describe clea
 as an attachment cleanup or guarantee that stored data has been erased.
 
 ```bash
-bash scripts/fns.sh rename --old-path 'Old.md' --path 'Archive/Old.md'
-bash scripts/fns.sh delete --path 'Draft.md'
-bash scripts/fns.sh restore --path 'Draft.md'
+python3 scripts/fns.py rename --old-path 'Old.md' --path 'Archive/Old.md'
+python3 scripts/fns.py delete --path 'Draft.md'
+python3 scripts/fns.py restore --path 'Draft.md'
 # Only after the requested scope has been reviewed and authorized:
-bash scripts/fns.sh recycle-clear --path 'Draft.md' --confirm
-bash scripts/fns.sh --vault 'Archive' recycle-clear --all --confirm-vault 'Archive'
+python3 scripts/fns.py recycle-clear --path 'Draft.md' --confirm
+python3 scripts/fns.py --vault 'Archive' recycle-clear --all --confirm-vault 'Archive'
 ```
 
 ## Output and failures
@@ -322,9 +367,11 @@ Help is text, not this envelope. Never expose raw login payloads or error bodies
 
 Redaction covers known tokens, usernames, passwords, authenticated proxy URLs,
 and proxy credential components, including URL-encoded and decoded forms.
-It applies recursively to JSON string values and object keys, including success
-payloads. **Stdout redaction can change matching secret text in returned note
-content; it does not change content sent to or stored by the server.**
+It applies recursively to payload string values and object keys, including
+success data. Client envelope keys (`success`, `code`, `data`, `error`, and error
+metadata) remain stable even if a credential equals `data`. **Stdout redaction
+can change matching secret text in returned note content; it does not change
+content sent to or stored by the server.**
 
 | Exit | Meaning |
 |---|---|
@@ -351,15 +398,23 @@ management are **out of scope for this release**. Any future additions require
 a separate scope decision; response link/file metadata does not add those
 commands to the current interface.
 
-Runtime requires Bash 3.2+, curl, jq, and standard Unix `iconv` for UTF-8
-validation, plus standard utilities such as `cp`, `cat`, `mktemp`, `mv`, and `rm`.
-Tests require Python 3.8+ and use only its standard library; Python is not a
-runtime dependency. From the repository root, run:
+Tests use Python 3.10+'s standard library test framework with the installed
+runtime dependencies, not curl/mock-curl fixtures. Use the same Python
+environment for commands and tests. From the repository root, run:
 
 ```bash
-bash -n obsidian-fastnotesync-skill/scripts/fns.sh
-shellcheck obsidian-fastnotesync-skill/scripts/fns.sh
+# Syntax check without execution or bytecode-cache files:
+python3 -B - <<'PY'
+import ast
+from pathlib import Path
+path = Path('obsidian-fastnotesync-skill/scripts/fns.py')
+compile(ast.parse(path.read_bytes(), filename=str(path)), str(path), 'exec')
+PY
 python3 -B -m unittest discover -s obsidian-fastnotesync-skill/tests -v
+# Optional legacy-launcher compatibility check, not a runtime requirement:
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck obsidian-fastnotesync-skill/scripts/fns.sh
+fi
 if command -v skills-ref >/dev/null 2>&1; then
   skills-ref validate obsidian-fastnotesync-skill
 fi
@@ -380,9 +435,11 @@ root, manually opt in with an exact-vault confirmation:
 python3 -B obsidian-fastnotesync-skill/tests/run_live.py --confirm-vault "$FNS_VAULT"
 ```
 
-Add optional `--allow-clear` only when recycle-clear tests are authorized.
-Current-run UUID path guards constrain fixture operations; the runner retains
-active fixtures and the vault, rather than performing complete teardown.
+The runner invokes `scripts/fns.py` with its current Python executable, so its
+environment must contain the installed runtime dependencies. Add optional
+`--allow-clear` only when recycle-clear tests are authorized. Current-run UUID
+path guards constrain fixture operations; the runner retains active fixtures
+and the vault, rather than performing complete teardown.
 Full clearing requires an initially empty vault and verification that every
 recycled path belongs to the current run's UUID scope. These are **non-atomic
 prechecks**: ensure there are no concurrent writers throughout the run.

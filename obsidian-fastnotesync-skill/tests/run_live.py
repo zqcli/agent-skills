@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Explicitly authorized live contract checks; Python 3.8+ standard library only.
+"""Explicitly authorized live contract checks; Python 3.10+ POSIX.
+
+The runner uses the standard library; the Python CLI requires requests[socks]
+and urllib3>=2.8.0,<3 for independent HTTPS proxy certificate verification.
 
 Securely provision FNS_BASE_URL, FNS_VAULT, FNS_AUTH_MODE=token, and FNS_TOKEN
 before invoking this runner. Strongly prefer a token scoped ONLY to the selected
@@ -27,7 +30,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -37,7 +39,7 @@ from urllib.parse import urlsplit
 import uuid
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "fns.sh"
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "fns.py"
 CALL_TIMEOUT = 120
 SCAN_TIMEOUT = 120
 MAX_SCAN_PAGES = 1000
@@ -124,12 +126,21 @@ def checked_environment(arguments):
     require(parsed.username is None and parsed.password is None)
     require(not parsed.query and not parsed.fragment)
     require(not any(character in base for character in ("\r", "\n", " ", "{", "}")))
-    require(SCRIPT.is_file())
-    require(all(shutil.which(tool, path=environment.get("PATH"))
-                for tool in ("bash", "curl", "jq", "iconv")))
+    require(SCRIPT.is_file() and sys.version_info >= (3, 10) and os.name == "posix")
+    # Check runtime imports only after scope/auth guards. --help and refused
+    # scope never need dependencies and cannot start a client/network call.
+    import requests
+    import socks
+    import urllib3
+    version = tuple(int(part) for part in requests.__version__.split(".")[:3])
+    urllib_version = tuple(int(part) for part in urllib3.__version__.split(".")[:3])
+    require((2, 34, 2) <= version < (3, 0, 0))
+    require((2, 8, 0) <= urllib_version < (3, 0, 0))
+    require(callable(socks.socksocket))
     # Token-only calls need no login credentials or shell startup hooks.
     for key in ("FNS_USERNAME", "FNS_PASSWORD", "BASH_ENV", "ENV"):
         environment.pop(key, None)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return environment
 
 
@@ -223,8 +234,7 @@ class LiveChecks:
         self.guard_call(command, arguments)
         require(timeout > 0)
         process = subprocess.Popen(
-            [shutil.which("bash", path=self.environment.get("PATH")), str(SCRIPT),
-             command, *arguments], env=self.environment,
+            [sys.executable, "-B", str(SCRIPT), command, *arguments], env=self.environment,
             stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         try:
