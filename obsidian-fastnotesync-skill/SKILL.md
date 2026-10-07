@@ -1,11 +1,12 @@
 ---
 name: obsidian-fastnotesync-skill
 description: >
-  Manage remote Obsidian Markdown notes through the Fast Note Sync Service REST
-  API using scripts/fns.py. Use for vault discovery, listing, path or content
-  search, reading, creating, updating, upserting, soft deletion, restoration,
-  append, prepend, replacement, frontmatter edits, renaming, and recycle clearing
-  without a local Obsidian installation.
+  Manage remote Obsidian Markdown notes and upload binary attachments through
+  the Fast Note Sync Service REST API using scripts/fns.py. Use for attachment
+  upload and metadata, vault discovery, listing, path or content search, reading,
+  creating, updating, upserting, soft deletion, restoration, append, prepend,
+  replacement, frontmatter edits, renaming, and recycle clearing without a local
+  Obsidian installation.
 license: MIT
 compatibility: >
   Requires Python 3.10+ on POSIX (macOS/Linux), requests[socks]>=2.34.2,<3,
@@ -19,7 +20,9 @@ allowed-tools: Bash
 
 # Obsidian FastNoteSync Skill
 
-Use `python3 scripts/fns.py` for note operations, vault discovery, and diagnostics.
+Use `python3 scripts/fns.py` for note operations, attachment upload/metadata,
+vault discovery, and diagnostics. The attachment extension keeps the existing
+`2.0.1` User-Agent identity so bound tokens do not silently stop working.
 Resolve script and reference paths relative to this skill directory, not the
 caller's working directory. Examples below run from the skill directory using
 the configured Python environment. `scripts/fns.sh` remains a thin compatible
@@ -346,6 +349,41 @@ python3 scripts/fns.py recycle-clear --path 'Draft.md' --confirm
 python3 scripts/fns.py --vault 'Archive' recycle-clear --all --confirm-vault 'Archive'
 ```
 
+## Binary attachments
+
+```text
+file-upload --file LOCAL --path REL [--overwrite] [--ctime MS] [--mtime MS]
+file-info   --path REL
+```
+
+Require an existing vault and a token allowing `rest`, `FNS_CLIENT`, `file_rw`
+(upload) or `file_r` (metadata); IP/UA/vault restrictions apply. Snapshot a regular
+binary file **before login/network**, maximum **10 MiB (10,485,760 bytes)**;
+empty files work, source changes fail locally. Multipart is not streaming/chunking.
+
+`--path` is an exact relative POSIX filename; Chinese/spaces/emoji work. Reject
+absolute paths, empty/dot/parent segments, repeated/trailing slashes, backslashes,
+`%`, controls and `:*?"<>|`. No normalization, stdin or custom pathHash is offered.
+
+GET metadata first; only HTTP 200/code 0/status false/exact `record not found`
+details/absent-or-null data means missing. Other failures stop. Existing targets
+require `--overwrite` (exit 6 otherwise); exact path/hash checking always applies.
+**Prechecks are not atomic create-only/CAS.** POST multipart, then verify code 1,
+acknowledgement and metadata GET. Vault appears only in form. Metadata/hash
+verification is not downloaded SHA-256. Never retry automatically: failure may
+leave a write. Upload never edits notes/links, permissions or vaults.
+
+Defaults: ctime current/preserved, mtime local. Explicit milliseconds override; zero asks server time.
+
+```bash
+python3 scripts/fns.py file-upload --file './image.png' --path 'attachments/image.png'
+python3 scripts/fns.py file-info --path 'attachments/image.png'
+# Add --overwrite only when replacement is authorized.
+```
+
+Slow uploads may require raising both `FNS_TIMEOUT` and `FNS_CONNECT_TIMEOUT` (defaults 30/10s).
+See [attachment contract and limitations](references/api-contract.md#attachment-upload-contract-and-protective-limits).
+
 ## Output and failures
 
 Every normal command returns one credential-redacted JSON envelope:
@@ -392,11 +430,12 @@ restriction; `315` scope/vault-access restriction; `420` missing vault;
 
 ## Scope and verification
 
-This lightweight CLI covers the note operations above, vault discovery, and
-diagnostics. History, backlinks/outlinks, attachment lifecycle, and vault
-management are **out of scope for this release**. Any future additions require
-a separate scope decision; response link/file metadata does not add those
-commands to the current interface.
+This lightweight CLI covers the note operations above, attachment upload and
+metadata, vault discovery, and diagnostics. Attachment download/delete/rename/
+restore, chunked upload, history, backlinks/outlinks, and vault management remain
+**out of scope**. Response link/file metadata does not implicitly add lifecycle
+commands. `tests/run_upload_live.py` is an opt-in test harness, not a production
+attachment download API.
 
 Tests use Python 3.10+'s standard library test framework with the installed
 runtime dependencies, not curl/mock-curl fixtures. Use the same Python
@@ -446,3 +485,15 @@ prechecks**: ensure there are no concurrent writers throughout the run.
 Keep all tests within that dedicated vault, never ordinary user notes. Do not
 include private instance URLs, actual vault names, credentials, live note data,
 or run-specific results in this documentation.
+
+### Disposable-instance upload tests
+
+Use a **fresh disposable FNS 3.6.1 instance**, independent SQLite/config/storage,
+never production. Loopback/tunnel alone is not isolation. Run from skill root:
+```bash
+python3 -B tests/run_upload_live.py --base-url 'http://127.0.0.1:39067' --confirm-isolated-instance
+```
+Tests use ephemeral credentials/vault, no inherited secrets/proxies, and verify
+five fixtures, SHA-256, overwrite/input/permission guards and unchanged notes.
+Operator must remove the isolated container/data/tunnel afterward. Details and
+test-only timeouts: [API contract](references/api-contract.md#opt-in-disposable-instance-attachment-runner).

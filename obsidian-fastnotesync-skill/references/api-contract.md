@@ -144,11 +144,13 @@ authority for HTTP methods and visibility.
 | `frontmatter` | `PATCH /api/note/frontmatter` | Body: `vault`, `path`, optional `updates`, `remove`. |
 | `rename` | `POST /api/note/rename` | Body: `vault`, `oldPath`, `path`, optional `oldPathHash`, `pathHash`. |
 | `recycle-clear` | `DELETE /api/note/recycle-clear` | JSON body: `vault`, and single-note `path` or empty `path` / `pathHash` for full clearing. |
+| `file-info` | `GET /api/file/info` | Query: `vault`, `path`; validates exact path/hash and metadata shape. |
+| `file-upload` | `GET /api/file/info`, `POST /api/file`, `GET /api/file/info` | Multipart: `vault`, `path`, binary `file`, millisecond `ctime`/`mtime`; optional client overwrite authorization, not atomic create-only. |
 
 Wire fields do not automatically create CLI switches. This lightweight CLI
-covers note operations, vault discovery, and diagnostics. History,
-backlinks/outlinks, attachment lifecycle, and vault management are outside this
-release; any future additions require a separate scope decision.
+covers note operations, attachment upload/metadata, vault discovery, and
+diagnostics. History, backlinks/outlinks, attachment download/delete/rename/
+restore, chunked upload, and vault management remain outside this release.
 
 ### Approved input rules
 
@@ -405,9 +407,76 @@ Read returns `content`, `path`, `pathHash`, `contentHash`, `ctime`, `mtime`,
 `version`, and `fileLinks` alongside other metadata. `fileLinks` maps embedded
 links to resolved file locations. It is response metadata only; note writes,
 renames, deletion, restoration, and recycle clearing do not promise the
-corresponding attachment lifecycle. History, backlinks/outlinks, and attachment
-CLI operations are out of scope. See [GET implementation][note-handler] and
-[response DTOs][note-dto].
+corresponding attachment lifecycle. `file-upload` and `file-info` are explicit,
+separate commands; they never insert a link or modify a note. Other attachment
+lifecycle commands, history, and backlinks/outlinks remain out of scope. See
+[GET implementation][note-handler] and [response DTOs][note-dto].
+
+### Attachment upload contract and protective limits
+
+The [file routes][routes], [file DTO][file-dto], [file handler][file-handler],
+[file service][file-service], and [file repository][file-repository] define the
+actual contract. `POST /api/file` is a **single whole-file multipart upload** in
+ordinary token auth, not a WebGUI-only route. Mandatory form fields are `vault`
+(existing vault name), `path` (logical path including filename), and file part
+`file`; optional wire fields are `pathHash`, `ctime`, `mtime`. The CLI does not
+accept or send arbitrary `pathHash`, UID, contentHash, savePath or session IDs.
+It sends the vault only in the form to avoid inconsistent query/form sources.
+
+Permissions require `rest`, matching `x-client`, and file read/write access for
+the precheck, upload and verification. A `file_r` token cannot upload. `GET
+/api/vault` is classified as `note_r`, so attachment-only access does not imply
+vault discovery. Manual tokens retain IP, UA and vault restrictions; neither
+upload nor readback rotates them or escalates permissions.
+
+The skill accepts one readable regular file, snapshots at most 10,485,760 bytes
+before login/network, verifies identity/size/mtime/ctime across the read, and
+sends unchanged binary bytes using Requests multipart encoding. Empty files
+are allowed. Binary paths must be strict relative POSIX paths; percentages,
+backslashes, empty/dot/parent segments, control characters and Windows-reserved
+characters are refused without normalization. No binary stdin or note-content
+options are added. The fixed cap bounds snapshot/multipart memory; it is not
+streaming upload and does not claim to implement server WebSocket chunking.
+
+The pinned `GET /api/file/info` handler wraps GORM's missing row error as generic
+`code: 0` with **HTTP 200, `status: false`, exact string `details: "record not
+found"`**. [Res.Data][response] is `json:"data,omitempty"`, so absent `data` is
+normal; explicit null is also harmless. Only this precise missing shape is
+accepted during the upload precheck. Missing/invalid status, other details,
+non-null data, HTTP 404, permission errors and other business errors do not
+justify a POST. Ordinary `file-info` still reports the missing row as failure.
+This narrow compatibility handling is pinned to 3.6.1, not a general code-0 rule.
+
+The metadata check requires positive integer ID, exact path, matching UTF-16
+path hash, nonnegative integer size/timestamps and canonical signed-int32 string
+content hash. An existing target is refused unless `--overwrite` is explicit,
+even if bytes are identical. Overwrite still verifies the actual path to detect
+hash collisions. Existing creation time is preserved unless explicitly supplied;
+new creation time defaults to client current time and mtime to the snapshot's
+filesystem mtime. Zero timestamps request server defaults.
+
+The POST must return business code 1 with matching path/hash/size/contentHash;
+then a final GET must match acknowledgement ID and all metadata and the supplied
+nonzero timestamps. The returned data is the verified GET payload. **Metadata
+readback is not a full-download or cryptographic checksum check.** The [upstream
+hash][file-hash] is a signed 32-bit rolling hash; paths use UTF-16 code units and
+contents use unsigned bytes. At or below 10 MiB it hashes all bytes; above that
+upstream samples only the first and last 5 MiB, a range this CLI disallows.
+
+`UpdateOrCreate(..., false)` unconditionally creates or overwrites based on
+UID/vault/pathHash; soft-deleted existing rows can be revived. There is no atomic
+create-only, CAS or idempotency key. The precheck cannot prevent concurrent writers
+from creating/updating between GET and POST. Repository updates replace the
+physical file before updating the database, without a cross-filesystem/database
+transaction or rollback. A failure or timeout may leave changes; **never retry
+automatically or claim that exit failure means no attachment was written**.
+
+The upstream handler reads the whole temporary file into memory. Gin multipart
+memory thresholds are not upload byte limits. Reverse-proxy request limits,
+server/client timeouts, and memory still constrain uploads. Requests' connect
+socket timeout can apply while sending the multipart body; for slower links
+both `FNS_TIMEOUT` and `FNS_CONNECT_TIMEOUT` may need explicit adjustment.
+Server/session chunk settings do not turn REST upload into resumable transfer.
 
 ## Verification
 
@@ -459,6 +528,24 @@ writers throughout the run. Confirmation flags do not authorize other vaults.
 Never include private instance URLs, actual vault names, credentials, live note
 data, or run-specific results in this documentation.
 
+### Opt-in disposable-instance attachment runner
+
+`tests/run_upload_live.py` must point only at a fresh, independent FNS 3.6.1
+instance with isolated SQLite/config/storage, no production mounts and no
+concurrent writers. It requires explicit numeric-loopback HTTP origin and
+`--confirm-isolated-instance`; it never reads inherited FNS/BW credentials or
+proxies. The operator remains responsible for proving container/tunnel isolation.
+
+The runner creates a random new user/vault/token and tests binary/PNG/Unicode/
+empty/10 MiB files, actual GET→POST→GET requests, complete downloaded bytes with
+SHA-256, default duplicate rejection, authorized overwrite, local input rejection,
+read-only/vault scope rejection and no changes to the new vault's note lists.
+It leaves fixture data only inside the throwaway instance. Container/tunnel/data
+teardown belongs to the operator, not a production lifecycle CLI. Live request
+limits are 120 seconds with a 60-second connect/body-send timeout, without
+changing production defaults. It outputs only safe JSON summaries and class/
+phase/numeric failure diagnostics, never raw requests or credentials.
+
 ## Sources: frozen upstream and transport dependencies
 
 [release]: https://github.com/haierkeys/fast-note-sync-service/releases/tag/3.6.1
@@ -468,6 +555,11 @@ data, or run-specific results in this documentation.
 [login-dto]: https://github.com/haierkeys/fast-note-sync-service/blob/7a6c78792c631f999c8a5f725bba5dd7235d6688/internal/dto/user_dto.go#L25-L31
 [auth]: https://github.com/haierkeys/fast-note-sync-service/blob/7a6c78792c631f999c8a5f725bba5dd7235d6688/internal/middleware/user_auth_token.go
 [webgui]: https://github.com/haierkeys/fast-note-sync-service/blob/7a6c78792c631f999c8a5f725bba5dd7235d6688/internal/middleware/webgui_auth.go
+[file-dto]: https://github.com/haierkeys/fast-note-sync-service/blob/7a6c78792c631f999c8a5f725bba5dd7235d6688/internal/dto/file_dto.go
+[file-handler]: https://github.com/haierkeys/fast-note-sync-service/blob/7a6c78792c631f999c8a5f725bba5dd7235d6688/internal/routers/api_router/handler_file.go
+[file-service]: https://github.com/haierkeys/fast-note-sync-service/blob/7a6c78792c631f999c8a5f725bba5dd7235d6688/internal/service/file_service.go
+[file-repository]: https://github.com/haierkeys/fast-note-sync-service/blob/7a6c78792c631f999c8a5f725bba5dd7235d6688/internal/dao/file_repository.go
+[file-hash]: https://github.com/haierkeys/fast-note-sync-service/blob/7a6c78792c631f999c8a5f725bba5dd7235d6688/pkg/util/hash.go
 [note-dto]: https://github.com/haierkeys/fast-note-sync-service/blob/7a6c78792c631f999c8a5f725bba5dd7235d6688/internal/dto/note_dto.go
 [note-handler]: https://github.com/haierkeys/fast-note-sync-service/blob/7a6c78792c631f999c8a5f725bba5dd7235d6688/internal/routers/api_router/handler_note.go
 [note-service]: https://github.com/haierkeys/fast-note-sync-service/blob/7a6c78792c631f999c8a5f725bba5dd7235d6688/internal/service/note_service.go

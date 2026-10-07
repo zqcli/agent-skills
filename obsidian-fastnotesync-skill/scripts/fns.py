@@ -11,11 +11,14 @@ from pathlib import Path
 import re
 import signal
 import ssl
+import stat
 import sys
 import time
 from urllib.parse import unquote, unquote_to_bytes, urlsplit
 
 VERSION = "2.0.1"
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+FILE_COMMANDS = {"file-upload", "file-info"}
 PUBLIC = {"doctor", "health", "version"}
 CONTENT_COMMANDS = {"create", "update", "upsert", "append", "prepend"}
 NOTE_COMMANDS = CONTENT_COMMANDS | {"read", "delete", "restore", "replace", "frontmatter", "rename", "recycle-clear"}
@@ -32,7 +35,9 @@ OPTIONS.update({"list": LIST_OPTIONS, "search": LIST_OPTIONS, "read": NOTE_OPTIO
                 "frontmatter": NOTE_OPTIONS | {"--updates", "--remove"},
                 "rename": NOTE_OPTIONS | {"--old-path", "--old-path-hash"},
                 "recycle-clear": NOTE_OPTIONS | {"--all", "--confirm", "--confirm-vault"}})
-FLAGS = {"--stdin", "--recycle", "--regex", "--all", "--fail-if-no-match", "--confirm"}
+OPTIONS["file-upload"] = {"--file", "--path", "--overwrite", "--ctime", "--mtime"}
+OPTIONS["file-info"] = {"--path"}
+FLAGS = {"--stdin", "--recycle", "--regex", "--all", "--fail-if-no-match", "--confirm", "--overwrite"}
 TEXT_OPTIONS = {"--content", "--find", "--replace", "--keyword"}
 BUSINESS_CODES = {0, 530}
 for _start, _end in ((300, 315), (400, 414), (420, 423), (430, 451), (455, 467),
@@ -55,6 +60,10 @@ frontmatter --path P [--updates JSON_OBJECT --remove JSON_STRING_ARRAY]
 rename --old-path P --path Q [--old-path-hash H --path-hash H]
 recycle-clear --path P --confirm [--path-hash H]
 recycle-clear --all --confirm-vault EXACT_VAULT
+file-upload --file LOCAL --path REL [--overwrite --ctime MS --mtime MS]
+            Single binary snapshot, at most 10 MiB. Existing targets require
+            --overwrite (precheck only, NOT atomic create-only or CAS).
+file-info --path REL
 --vault overrides FNS_VAULT anywhere. Secrets must never be CLI arguments.
 """
 
@@ -150,6 +159,10 @@ def parse(argv):
     require(command is not None, "Command required")
     if command in NOTE_COMMANDS and not (command == "recycle-clear" and values.get("all")):
         require(bool(values.get("path")), "Nonempty --path required")
+    if command in FILE_COMMANDS:
+        attachment_path(values.get("path", ""))
+    if command == "file-upload":
+        require(bool(values.get("file")), "A local --file is required")
     if command in CONTENT_COMMANDS:
         require(len(CONTENT_OPTIONS & seen) == 1, "Choose exactly one explicit content source")
     if command == "replace":
@@ -360,7 +373,12 @@ class Client:
         for scheme in ("http://", "https://"):
             self.session.mount(scheme, verified_adapter(requests, self.verify))
 
-    def request(self, method, endpoint, authenticated=True, body=None, params=None):
+    def request(self, method, endpoint, authenticated=True, body=None, params=None, *,
+                form=None, files=None, missing_file_ok=False):
+        if body is not None and (form is not None or files is not None):
+            usage_error("JSON and multipart request bodies are mutually exclusive")
+        if missing_file_ok and (method != "GET" or endpoint != "/api/file/info"):
+            usage_error("Missing-file handling is restricted to the upload precheck")
         url = self.base + endpoint
         headers = {"User-Agent": self.agent, "x-client": self.client}
         if authenticated:
@@ -372,9 +390,11 @@ class Client:
                     if proxy and key in ("http", "https", "all"):
                         validate_url(proxy, proxy=True)
                         self.redactor.add_proxy(proxy)
-                response = self.session.request(method, url, headers=headers, json=body, params=params,
+                body_options = {"data": form, "files": files} if files is not None or form is not None else {"json": body}
+                response = self.session.request(method, url, headers=headers, params=params,
                                                 proxies=proxies, verify=self.verify,
-                                                timeout=(self.connect_timeout, self.timeout), allow_redirects=False)
+                                                timeout=(self.connect_timeout, self.timeout), allow_redirects=False,
+                                                **body_options)
                 try:
                     http = response.status_code
                     if not 200 <= http < 300:
@@ -386,6 +406,12 @@ class Client:
                     if not isinstance(value, dict) or type(value.get("code")) is not int or ("status" in value and type(value["status"]) is not bool):
                         raise Failure(4, "protocol", "Invalid JSON response envelope", http=http)
                     code = value["code"]
+                    # This pinned endpoint wraps a missing record as generic code 0.
+                    # Never confuse arbitrary code-0 errors with permission to write.
+                    if (missing_file_ok and http == 200 and code == 0 and
+                            value.get("status") is False and value.get("data") is None and
+                            value.get("details") == "record not found"):
+                        return None
                     if code in range(1, 7):
                         if value.get("status") is False:
                             raise Failure(5, "business", "Server reported a business failure", code, http)
@@ -434,6 +460,115 @@ def content_input(values):
         usage_error("Content source must be readable and valid UTF-8")
 
 
+def attachment_path(path):
+    require(isinstance(path, str) and bool(path) and
+            re.search(r'[\x00-\x1f\x7f-\x9f\\%:*?"<>|]', path) is None and
+            all(part not in ("", ".", "..") for part in path.split("/")),
+            "Attachment path must be a safe relative POSIX file path")
+
+
+def attachment_input(values):
+    """Snapshot bounded binary input before authentication or network activity."""
+    path = Path(values["file"])
+
+    def signature(info):
+        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+    try:
+        before = path.stat()
+        require(stat.S_ISREG(before.st_mode), "Attachment source must be a regular file")
+        require(before.st_size <= MAX_UPLOAD_BYTES, "Attachment exceeds the 10 MiB limit")
+        # Nonblocking open also avoids hanging if a regular file is replaced by a FIFO.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            stream = os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with stream:
+            opened = os.fstat(stream.fileno())
+            require(stat.S_ISREG(opened.st_mode) and signature(opened) == signature(before),
+                    "Attachment source changed before reading")
+            raw = stream.read(MAX_UPLOAD_BYTES + 1)
+            require(len(raw) == before.st_size and
+                    signature(os.fstat(stream.fileno())) == signature(before) and
+                    signature(path.stat()) == signature(before),
+                    "Attachment source changed while reading")
+        return {"bytes": raw, "mtime": max(0, before.st_mtime_ns // 1000000)}
+    except OSError:
+        usage_error("Attachment source must be a readable regular file")
+
+
+def hash32(units):
+    result = 0
+    for unit in units:
+        result = (31 * result + unit) & 0xffffffff
+    return str(result if result < 0x80000000 else result - 0x100000000)
+
+
+def attachment_path_hash(path):
+    raw = path.encode("utf-16-be", "strict")
+    return hash32(int.from_bytes(raw[index:index + 2], "big") for index in range(0, len(raw), 2))
+
+
+def file_metadata(data, path, *, timestamps=True):
+    def valid_integer(value, minimum=0):
+        return type(value) is int and minimum <= value <= 0x7fffffffffffffff
+
+    def valid_hash(value):
+        return (isinstance(value, str) and len(value) <= 11 and
+                re.fullmatch(r"(?:0|-?[1-9][0-9]*)", value, re.ASCII) is not None and
+                -0x80000000 <= int(value) <= 0x7fffffff)
+
+    valid = (isinstance(data, dict) and valid_integer(data.get("id"), 1) and
+             data.get("path") == path and data.get("pathHash") == attachment_path_hash(path) and
+             valid_integer(data.get("size")) and valid_hash(data.get("contentHash")))
+    if valid:
+        valid = all(valid_integer(data.get(key)) for key in ("ctime", "mtime")
+                    if timestamps or key in data)
+    if not valid:
+        raise Failure(4, "protocol", "Invalid or mismatched attachment metadata; no automatic retry")
+    return data
+
+
+def file_info(client, path, *, missing_ok=False):
+    result = client.request("GET", "/api/file/info", params={"vault": client.vault, "path": path},
+                            missing_file_ok=missing_ok)
+    if result is None:
+        return None
+    if result["code"] != 1:
+        raise Failure(4, "protocol", "Unexpected attachment response code")
+    file_metadata(result["data"], path)
+    return result
+
+
+def upload_file(client, values, snapshot):
+    path, raw = values["path"], snapshot["bytes"]
+    current = file_info(client, path, missing_ok=True)
+    if current is not None and not values.get("overwrite"):
+        raise Failure(6, "precondition", "Attachment already exists; use --overwrite only when authorized")
+    ctime = values.get("ctime", current["data"]["ctime"] if current else int(time.time() * 1000))
+    mtime = values.get("mtime", snapshot["mtime"])
+    expected_hash = hash32(raw)  # Inputs are capped at 10 MiB: upstream hashes all bytes.
+    result = client.request("POST", "/api/file",
+                            form={"vault": client.vault, "path": path, "ctime": str(ctime), "mtime": str(mtime)},
+                            files={"file": (path.rsplit("/", 1)[-1], raw, "application/octet-stream")})
+    if result["code"] != 1:
+        raise Failure(4, "protocol", "Unexpected upload response code; write outcome may be unknown")
+    uploaded = file_metadata(result["data"], path, timestamps=False)
+    if uploaded["size"] != len(raw) or uploaded["contentHash"] != expected_hash:
+        raise Failure(4, "protocol", "Upload acknowledgement mismatch; write outcome may be unknown")
+    verified = file_info(client, path)
+    actual = verified["data"]
+    for key in ("id", "path", "pathHash", "size", "contentHash", "ctime", "mtime"):
+        if key in uploaded and actual[key] != uploaded[key]:
+            raise Failure(4, "protocol", "Upload readback mismatch; write outcome may be unknown")
+    # Zero timestamps request server-assigned times, not preservation of zero.
+    if (ctime and actual["ctime"] != ctime) or (mtime and actual["mtime"] != mtime):
+        raise Failure(4, "protocol", "Upload timestamp mismatch; write outcome may be unknown")
+    return verified
+
+
 def clear_guard(values, vault):
     if values.get("all"):
         require(bool(vault) and values.get("confirm_vault") == vault and not values.get("confirm")
@@ -445,6 +580,8 @@ def clear_guard(values, vault):
 
 
 def execute(client, command, values, content):
+    if command not in OPTIONS:
+        usage_error("Unsupported command dispatch")
     request = client.request
     if command == "doctor":
         health = request("GET", "/api/health", False)
@@ -456,6 +593,10 @@ def execute(client, command, values, content):
         client.login()
     if command == "vaults":
         return request("GET", "/api/vault")
+    if command == "file-info":
+        return file_info(client, values["path"])
+    if command == "file-upload":
+        return upload_file(client, values, content)
     if command in ("list", "search"):
         params = {"vault": client.vault, "keyword": values.get("keyword", ""),
                   "searchMode": values.get("search_mode", "content" if command == "search" else "path"),
@@ -508,8 +649,10 @@ def execute(client, command, values, content):
         return request("POST", "/api/note/rename", body=body)
     if command == "restore":
         return request("PUT", "/api/note/restore", body=note)
-    body = {"vault": client.vault} if values.get("all") else note
-    return request("DELETE", "/api/note/recycle-clear", body=body)
+    if command == "recycle-clear":
+        body = {"vault": client.vault} if values.get("all") else note
+        return request("DELETE", "/api/note/recycle-clear", body=body)
+    usage_error("Unsupported command dispatch")
 
 
 def emit(value):
@@ -527,7 +670,8 @@ def main(argv=None):
         environment = dict(os.environ)
         if command == "recycle-clear":
             clear_guard(values, values.get("vault", environment.get("FNS_VAULT", "")))
-        content = content_input(values) if command in CONTENT_COMMANDS else None
+        content = (attachment_input(values) if command == "file-upload" else
+                   content_input(values) if command in CONTENT_COMMANDS else None)
         client = Client(environment, command, values)
         result = execute(client, command, values, content)
         # Only redact payload keys/values; never rename the client-owned envelope.
