@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fast Note Sync REST CLI; Python 3.10+ on macOS/Linux with requests[socks]."""
+"""Fast Note Sync REST CLI; Python 3.10+ on Windows/macOS/Linux with requests[socks]."""
 
 from contextlib import contextmanager
 import base64
@@ -13,10 +13,14 @@ import signal
 import ssl
 import stat
 import sys
+import threading
 import time
 from urllib.parse import unquote, unquote_to_bytes, urlsplit
 
-VERSION = "2.0.1"
+VERSION = "2.10"
+# Keep the transport identity stable for existing User-Agent-bound tokens.
+DEFAULT_USER_AGENT = "obsidian-fastnotesync-skill/2.0.1"
+REQUEST_FAILURE = "Request failed or timed out; write outcome may be unknown. Do not automatically retry."
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 FILE_COMMANDS = {"file-upload", "file-info"}
 PUBLIC = {"doctor", "health", "version"}
@@ -274,6 +278,37 @@ class Redactor:
 @contextmanager
 def deadline(seconds):
     """Requests read timeouts are inactivity limits, not a wall-clock deadline."""
+    if os.name == "nt":
+        cancelled = threading.Event()
+
+        def expired():
+            if cancelled.wait(seconds):
+                return
+
+            def report():
+                try:
+                    emit({"success": False, "error": {"type": "transport", "message": REQUEST_FAILURE}})
+                    sys.stdout.flush()
+                except Exception:
+                    pass  # A closed output pipe must not keep the request alive.
+
+            # Output itself may block: allow a brief best-effort report, then stop
+            # the CLI, not just a worker thread that could leave a write running.
+            try:
+                reporter = threading.Thread(target=report, daemon=True)
+                reporter.start()
+                reporter.join(0.1)
+            finally:
+                os._exit(3)
+
+        watchdog = threading.Thread(target=expired, daemon=True)
+        watchdog.start()
+        try:
+            yield
+        finally:
+            cancelled.set()
+            watchdog.join()
+        return
     old_handler = signal.getsignal(signal.SIGALRM)
     old_timer = signal.getitimer(signal.ITIMER_REAL)
     started = time.monotonic()
@@ -332,10 +367,10 @@ class Client:
             self.connect_timeout = min(integer(environment.get("FNS_CONNECT_TIMEOUT") or "10"), self.timeout)
         except Failure:
             raise Failure(2, "config", "Timeouts must be positive integer seconds") from None
-        if os.name != "posix" or not hasattr(signal, "setitimer"):
-            raise Failure(2, "config", "POSIX request deadlines require macOS or Linux")
+        if os.name != "nt" and (os.name != "posix" or not hasattr(signal, "setitimer")):
+            raise Failure(2, "config", "Request deadlines require Windows, macOS or Linux")
         self.client = header_value(environment.get("FNS_CLIENT") or "obsidian-fastnotesync-skill")
-        self.agent = header_value(environment.get("FNS_USER_AGENT") or "obsidian-fastnotesync-skill/" + VERSION)
+        self.agent = header_value(environment.get("FNS_USER_AGENT") or DEFAULT_USER_AGENT)
         self.token = environment.get("FNS_TOKEN", "")
         if self.token:
             header_value(self.token)
@@ -423,7 +458,7 @@ class Client:
                 finally:
                     response.close()
         except (DeadlineExceeded, self.requests.exceptions.RequestException):
-            raise Failure(3, "transport", "Request failed or timed out; write outcome may be unknown. Do not automatically retry.") from None
+            raise Failure(3, "transport", REQUEST_FAILURE) from None
         except OSError:
             raise Failure(2, "config", "Unable to use the configured TLS certificate bundle") from None
 
@@ -471,15 +506,18 @@ def attachment_input(values):
     """Snapshot bounded binary input before authentication or network activity."""
     path = Path(values["file"])
 
-    def signature(info):
-        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+    def signature(info, cross_source=False):
+        result = info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+        # Windows CPython may report different ctime semantics for stat/fstat.
+        # Keep it for same-source comparisons, especially fstat before/after read.
+        return result[:-1] if os.name == "nt" and cross_source else result
 
     try:
         before = path.stat()
         require(stat.S_ISREG(before.st_mode), "Attachment source must be a regular file")
         require(before.st_size <= MAX_UPLOAD_BYTES, "Attachment exceeds the 10 MiB limit")
         # Nonblocking open also avoids hanging if a regular file is replaced by a FIFO.
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
         try:
             stream = os.fdopen(fd, "rb")
         except BaseException:
@@ -487,11 +525,12 @@ def attachment_input(values):
             raise
         with stream:
             opened = os.fstat(stream.fileno())
-            require(stat.S_ISREG(opened.st_mode) and signature(opened) == signature(before),
+            require(stat.S_ISREG(opened.st_mode) and
+                    signature(opened, cross_source=True) == signature(before, cross_source=True),
                     "Attachment source changed before reading")
             raw = stream.read(MAX_UPLOAD_BYTES + 1)
             require(len(raw) == before.st_size and
-                    signature(os.fstat(stream.fileno())) == signature(before) and
+                    signature(os.fstat(stream.fileno())) == signature(opened) and
                     signature(path.stat()) == signature(before),
                     "Attachment source changed while reading")
         return {"bytes": raw, "mtime": max(0, before.st_mtime_ns // 1000000)}

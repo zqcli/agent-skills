@@ -17,6 +17,7 @@ import logging
 import os
 from pathlib import Path
 import select
+import shutil
 import signal
 import socket
 import socketserver
@@ -41,6 +42,7 @@ TOKEN = "synthetic-fns-token-ONLY-FOR-TESTS"
 LOGIN_TOKEN = "synthetic-login-token-ONLY-FOR-TESTS"
 VAULT = "synthetic-vault"
 UNSET = object()
+POSIX_TIMERS = os.name == "posix" and hasattr(signal, "setitimer")
 INVALID_UTF8_CASES = (
     ("invalid_single_byte", b'#title\ncaf\xe9\n'),
     ("above_unicode_maximum", b'#title\n\xf4\x90\x80\x80\n'),
@@ -472,6 +474,89 @@ class MockSOCKS5:
         self.thread.join(timeout=2)
 
 
+def _deadline_probe(scenario):
+    """Child-only timeout probe: patched Requests and no possible live sockets."""
+    import requests
+    spec = importlib.util.spec_from_file_location("fns_deadline_probe", SCRIPT)
+    client = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = client
+    spec.loader.exec_module(client)
+    real_decode = json.JSONDecoder.raw_decode
+
+    def trace(marker):
+        print(marker, file=sys.stderr, flush=True)
+
+    def request(session, method, url, **kwargs):
+        trace("HTTP " + method + " " + urlsplit(url).path)
+        if scenario in ("closed-output", "blocked-write", "blocked-flush"):
+            time.sleep(3)
+            trace("HTTP_RESUMED")
+        if scenario == "cancel-error":
+            raise requests.exceptions.ReadTimeout("Synthetic failure " + TOKEN)
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps(envelope({
+            "ctime": 123, "delayed_decode_probe": True})).encode("utf-8")
+        response._content_consumed = True
+        return response
+
+    def select_proxy(*_args, **_kwargs):
+        trace("PROXY_SELECTION")
+        time.sleep(3)
+        trace("PROXY_SELECTION_RESUMED")
+        return {}
+
+    def decode(decoder, value, *args, **kwargs):
+        if "delayed_decode_probe" in value:
+            trace("JSON_DECODING")
+            time.sleep(3)
+            trace("JSON_DECODING_RESUMED")
+        return real_decode(decoder, value, *args, **kwargs)
+
+    class BlockedOutput(io.StringIO):
+        def write(self, value):
+            if scenario == "blocked-write":
+                trace("OUTPUT_WRITE_BLOCKED")
+                threading.Event().wait()
+            return super().write(value)
+
+        def flush(self):
+            trace("OUTPUT_FLUSH_BLOCKED")
+            threading.Event().wait()
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch.object(requests.Session, "request", request))
+        for name in ("socket.getaddrinfo", "socket.create_connection", "socket.socket.connect"):
+            stack.enter_context(mock.patch(name, side_effect=AssertionError("No live sockets in probe")))
+        if scenario == "proxy":
+            stack.enter_context(mock.patch.object(requests.utils, "get_environ_proxies", select_proxy))
+        elif scenario == "decode":
+            stack.enter_context(mock.patch.object(json.JSONDecoder, "raw_decode", decode))
+        elif scenario == "closed-output":
+            sys.stdout.close()
+        elif scenario in ("blocked-write", "blocked-flush"):
+            stack.enter_context(contextlib.redirect_stdout(BlockedOutput()))
+        elif scenario in ("cancel-success", "cancel-error", "cancel-repeated"):
+            pass
+        else:
+            raise AssertionError("Unknown deadline probe")
+        if scenario.startswith("cancel-"):
+            arguments = (["doctor"] if scenario == "cancel-repeated"
+                         else ["read", "--path", "x.md"])
+            code = client.main(arguments)
+            trace("MAIN_RETURNED " + str(code))
+            if any(thread is not threading.main_thread() for thread in threading.enumerate()):
+                raise AssertionError("Request left a watchdog/reporter alive")
+            # A cancelled watchdog must stay quiet beyond its original deadline,
+            # including when main() already returned a transport failure (3).
+            time.sleep(1.3)
+            trace("NO_LATE_TIMEOUT")
+        else:
+            # A delayed preread must never continue to the subsequent write.
+            code = client.main(["update", "--path", "x.md", "--content", "body"])
+    raise SystemExit(code)
+
+
 class CLIBase(unittest.TestCase):
     def setUp(self):
         self.assertTrue(SCRIPT.is_file(), "Required CLI script is missing: {}".format(SCRIPT))
@@ -490,6 +575,10 @@ class CLIBase(unittest.TestCase):
         self.env = {"PATH": path, "HOME": str(self.home), "TMPDIR": str(self.tmp),
                     "LC_ALL": "C", "LANG": "C", "FNS_TOKEN": TOKEN,
                     "FNS_VAULT": VAULT, "PYTHONDONTWRITEBYTECODE": "1", "NO_PROXY": "*"}
+        if os.name == "nt":
+            # Required by Windows TLS/process startup; inherit no credentials.
+            self.env["SystemRoot"] = os.environ["SystemRoot"]
+            self.env.update(TEMP=str(self.tmp), TMP=str(self.tmp))
 
     def run_cli(self, *args, env=None, stdin=None):
         child_env = self.env.copy()
@@ -498,10 +587,75 @@ class CLIBase(unittest.TestCase):
                 child_env.pop(key, None)
             else:
                 child_env[key] = str(value)
-        return subprocess.run(
+        # Text-mode subprocess stdin rewrites LF to CRLF on Windows. Send the
+        # exact UTF-8 bytes, then decode only the captured diagnostics.
+        raw = subprocess.run(
             [sys.executable, "-B", str(SCRIPT), *args], env=child_env, cwd=self.root,
-            input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            encoding="utf-8", timeout=12, check=False)
+            input=stdin.encode("utf-8") if isinstance(stdin, str) else stdin,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=12, check=False)
+        return subprocess.CompletedProcess(raw.args, raw.returncode,
+                                           raw.stdout.decode("utf-8"), raw.stderr.decode("utf-8"))
+
+    @contextlib.contextmanager
+    def observe_watchdogs(self):
+        """Observe real Windows threads, including cancellation on error paths."""
+        watchdogs, joined = [], set()
+        real_start, real_join = threading.Thread.start, threading.Thread.join
+
+        def start(thread, *args, **kwargs):
+            watchdogs.append(thread)
+            return real_start(thread, *args, **kwargs)
+
+        def join(thread, *args, **kwargs):
+            joined.add(thread)
+            return real_join(thread, *args, **kwargs)
+
+        try:
+            with contextlib.ExitStack() as stack:
+                if os.name == "nt":
+                    stack.enter_context(mock.patch.object(threading.Thread, "start", start))
+                    stack.enter_context(mock.patch.object(threading.Thread, "join", join))
+                yield watchdogs
+        finally:
+            for watchdog in watchdogs:
+                self.assertTrue(watchdog.daemon, "Request watchdogs must not block process exit")
+                self.assertIn(watchdog, joined, "Request cleanup must join its watchdog")
+                self.assertFalse(watchdog.is_alive(), "Request watchdog must be cancelled and joined")
+
+    def deadline_record(self, watchdogs):
+        return {"timer": signal.getitimer(signal.ITIMER_REAL)[0] if POSIX_TIMERS else None,
+                "watchdogs": tuple(thread for thread in watchdogs if thread.is_alive())}
+
+    def assert_request_deadline(self, record, total):
+        if os.name == "nt":
+            self.assertEqual(len(record["watchdogs"]), 1,
+                             "Exactly one watchdog must cover each request")
+        else:
+            self.assertGreater(record["timer"], 0, "A total POSIX deadline must cover request execution")
+            self.assertLessEqual(record["timer"], total)
+
+    def run_deadline_child(self, scenario):
+        # Never let Windows' deliberate os._exit(3) run in the unittest host.
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); "
+                "import test_fns; test_fns._deadline_probe(sys.argv[2])")
+        started = time.monotonic()
+        try:
+            result = subprocess.run(
+                [sys.executable, "-B", "-c", code, str(Path(__file__).parent), scenario],
+                env={**self.env, "FNS_TIMEOUT": "1"}, cwd=self.root,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                encoding="utf-8", timeout=4, check=False)
+        except subprocess.TimeoutExpired:
+            self.fail("Request deadline did not terminate the child within four seconds")
+        elapsed = time.monotonic() - started
+        self.assertGreater(elapsed, 0.7, "Exercise the actual one-second deadline")
+        self.assertLess(elapsed, 2.5, "Deadline must expire before the delayed phase resumes")
+        return result
+
+    def assert_deadline_failure(self, result):
+        value = self.assert_failure(result, 3)
+        self.assertEqual(value["error"], {"type": "transport", "message":
+            "Request failed or timed out; write outcome may be unknown. Do not automatically retry."})
 
     def output(self, result):
         try:
@@ -1036,14 +1190,28 @@ class HTTPContractTests(CLIBase):
 
     def test_thin_shell_wrapper_preserves_python_entry_output_and_exit(self):
         self.assertTrue(WRAPPER.is_file(), "The compatibility wrapper must exist")
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash, "The wrapper contract requires an actual bash executable")
+        wrapper_env = self.env.copy()
+        # Windows venvs have python.exe, not python3. Bind the real shell wrapper
+        # to the same tested interpreter without using a host-global alias.
+        shim_dir = self.root / "wrapper-bin"
+        shim_dir.mkdir()
+        shim = shim_dir / "python3"
+        shim.write_text('#!/bin/sh\nexec "$FNS_TEST_PYTHON" "$@"\n', encoding="utf-8", newline="\n")
+        shim.chmod(0o700)
+        wrapper_env.update(FNS_TEST_PYTHON=sys.executable,
+                          PATH=os.pathsep.join((str(shim_dir), str(Path(bash).parent),
+                                               wrapper_env["PATH"])))
         for arguments in (("--help",), ("read", "--path", "x.md"), ("unknown-command",)):
             with self.subTest(arguments=arguments):
                 self.reply(envelope({"wrapper": True}))
                 direct = self.run_cli(*arguments)
                 self.reply(envelope({"wrapper": True}))
-                wrapped = subprocess.run(["/bin/bash", str(WRAPPER), *arguments], env=self.env,
-                                         cwd=self.root, capture_output=True, encoding="utf-8",
-                                         timeout=8, check=False)
+                raw = subprocess.run([bash, str(WRAPPER), *arguments], env=wrapper_env,
+                                     cwd=self.root, capture_output=True, timeout=8, check=False)
+                wrapped = subprocess.CompletedProcess(raw.args, raw.returncode,
+                    raw.stdout.decode("utf-8"), raw.stderr.decode("utf-8"))
                 self.assertEqual(wrapped.returncode, direct.returncode)
                 if arguments == ("--help",):
                     self.assertEqual(wrapped.stdout, direct.stdout)
@@ -1359,8 +1527,7 @@ class HTTPContractTests(CLIBase):
             for encoding, payload in INVALID_UTF8_CASES:
                 with self.subTest(command=command, encoding=encoding):
                     self.reply(envelope({"token": LOGIN_TOKEN}), envelope({}))
-                    # Deliberately bypass text-mode run_cli so Python cannot decode
-                    # or normalize the malformed bytes before the CLI sees them.
+                    # Send malformed bytes without decoding them in the parent.
                     raw = subprocess.run(
                         [sys.executable, "-B", str(SCRIPT), command, "--path", "x.md", "--stdin"],
                         env=child_env, cwd=self.root, input=payload,
@@ -1374,6 +1541,7 @@ class HTTPContractTests(CLIBase):
                     result = subprocess.CompletedProcess(raw.args, raw.returncode, stdout, stderr)
                     self.assert_failure(result, 2, secrets=("synthetic-utf8-password",))
 
+    @unittest.skipUnless(os.name == "posix", "Only POSIX supports invalid byte argv")
     def test_invalid_utf8_literal_posix_argv_is_rejected_before_login_or_network(self):
         environment = {**self.env, "FNS_AUTH_MODE": "password",
                        "FNS_USERNAME": "synthetic-utf8-user", "FNS_PASSWORD": "synthetic-utf8-password"}
@@ -2116,7 +2284,7 @@ class TransportSecurityContractTests(CLIBase):
                 "verify": verify, "kwargs": kwargs,
                 "retries": {scheme: session.get_adapter(scheme + "://contract.invalid").max_retries.total
                             for scheme in ("http", "https")},
-                "timer": signal.getitimer(signal.ITIMER_REAL)[0]})
+                **owner.deadline_record(watchdogs)})
             if not owner.responses:
                 raise AssertionError("Unscripted Requests call")
             response = owner.responses.pop(0)
@@ -2149,6 +2317,7 @@ class TransportSecurityContractTests(CLIBase):
 
         try:
             with contextlib.ExitStack() as stack:
+                watchdogs = stack.enter_context(self.observe_watchdogs())
                 stack.enter_context(mock.patch.dict(os.environ, environment, clear=True))
                 stack.enter_context(mock.patch.object(sys, "argv", [str(SCRIPT), *arguments]))
                 stack.enter_context(contextlib.redirect_stdout(output))
@@ -2324,8 +2493,7 @@ class TransportSecurityContractTests(CLIBase):
                 self.assertLessEqual(timeout[0], connect)
                 self.assertGreater(timeout[1], 0)
                 self.assertLessEqual(timeout[1], total)
-                self.assertGreater(record["timer"], 0, "A total POSIX deadline must cover request execution")
-                self.assertLessEqual(record["timer"], total)
+                self.assert_request_deadline(record, total)
 
     def test_nonloopback_http_requires_explicit_allowance(self):
         for allowance in (None, "0", "1"):
@@ -2434,6 +2602,7 @@ class TransportSecurityContractTests(CLIBase):
                 self.assert_success(self.run_main("read", "--path", "x.md", env=environment))
                 self.assert_transport_security()
 
+    @unittest.skipUnless(POSIX_TIMERS, "POSIX SIGALRM timer restoration")
     def test_signal_handler_and_existing_timer_restored_on_success_and_failure(self):
         original_handler = signal.getsignal(signal.SIGALRM)
         original_timer = signal.getitimer(signal.ITIMER_REAL)
@@ -2460,24 +2629,49 @@ class TransportSecurityContractTests(CLIBase):
             signal.setitimer(signal.ITIMER_REAL, *original_timer)
 
     def test_total_deadline_includes_response_json_decoding(self):
-        self.reply(envelope({"delayed_decode_probe": True}))
-        real_decode = json.JSONDecoder.raw_decode
+        result = self.run_deadline_child("decode")
+        self.assert_deadline_failure(result)
+        self.assertEqual(result.stderr.splitlines(), ["HTTP GET /api/note", "JSON_DECODING"],
+                         "Decoding timeout must not resume or send a subsequent write")
 
-        def slow_decode(decoder, value, *arguments, **kwargs):
-            if "delayed_decode_probe" in value:
-                time.sleep(2)
-            return real_decode(decoder, value, *arguments, **kwargs)
+    def test_total_deadline_includes_environment_proxy_selection(self):
+        result = self.run_deadline_child("proxy")
+        self.assert_deadline_failure(result)
+        self.assertEqual(result.stderr.splitlines(), ["PROXY_SELECTION"],
+                         "Proxy selection timeout must expire before any HTTP")
 
-        started = time.monotonic()
-        # The public stdlib decoder seam also covers imported json.loads aliases
-        # and directly constructed decoders, without naming client internals.
-        with mock.patch.object(json.JSONDecoder, "raw_decode", new=slow_decode):
-            result = self.run_main("read", "--path", "x.md", env={"FNS_TIMEOUT": "1"})
-        self.assertLess(time.monotonic() - started, 1.8)
-        self.assert_failure(result, 3)
-        self.assertEqual(len(self.transport_calls), 1)
+    @unittest.skipUnless(os.name == "nt", "Windows hard-exit watchdog output handling")
+    def test_windows_deadline_terminates_with_closed_or_blocked_output(self):
+        for scenario, marker in (("closed-output", None),
+                                 ("blocked-write", "OUTPUT_WRITE_BLOCKED"),
+                                 ("blocked-flush", "OUTPUT_FLUSH_BLOCKED")):
+            with self.subTest(output=scenario):
+                result = self.run_deadline_child(scenario)
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "", "Closed/blocked output must not leak request data")
+                self.assertEqual(result.stderr.splitlines(),
+                                 ["HTTP GET /api/note"] + ([marker] if marker else []),
+                                 "Reporter failure must not resume HTTP or subsequent work")
+                self.assertNotIn(TOKEN, result.stdout + result.stderr)
 
-    def test_total_deadline_includes_environment_proxy_selection_and_restores_timer(self):
+    @unittest.skipUnless(os.name == "nt", "Windows watchdog cancellation after main returns")
+    def test_windows_watchdog_stays_cancelled_after_success_error_and_repeated_requests(self):
+        for scenario in ("cancel-success", "cancel-error", "cancel-repeated"):
+            with self.subTest(scenario=scenario):
+                result = self.run_deadline_child(scenario)
+                if scenario == "cancel-error":
+                    self.assert_deadline_failure(result)
+                    exit_code = 3
+                else:
+                    self.assert_success(result)
+                    exit_code = 0
+                requests = (["HTTP GET /api/health", "HTTP GET /api/version"]
+                            if scenario == "cancel-repeated" else ["HTTP GET /api/note"])
+                self.assertEqual(result.stderr.splitlines(),
+                                 [*requests, "MAIN_RETURNED " + str(exit_code), "NO_LATE_TIMEOUT"])
+
+    @unittest.skipUnless(POSIX_TIMERS, "POSIX SIGALRM timer restoration after timeout")
+    def test_posix_timer_restored_after_environment_proxy_selection_timeout(self):
         original_handler = signal.getsignal(signal.SIGALRM)
         original_timer = signal.getitimer(signal.ITIMER_REAL)
         sentinel = lambda *_: None

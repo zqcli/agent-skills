@@ -1,4 +1,4 @@
-# FastNoteSync 2.0.1 API Contract
+# FastNoteSync 2.10 API Contract
 
 ## Frozen source and authority
 
@@ -9,11 +9,11 @@ This contract targets the official `haierkeys/fast-note-sync-service` repository
 | Upstream tag | `3.6.1` |
 | Commit | `7a6c78792c631f999c8a5f725bba5dd7235d6688` |
 | Release publication | August 14, 2026 (`2026-08-14T17:15:46Z`) |
-| Skill version | `2.0.1` |
-| CLI entry point | `python3 scripts/fns.py`, relative to the skill directory |
-| Legacy entry point | `scripts/fns.sh`, a thin Python launcher requiring POSIX `sh`, not a separate transport |
-| Runtime | Python 3.10+ on POSIX (macOS/Linux), `requests[socks]>=2.34.2,<3`, `urllib3>=2.8.0,<3` |
-| Test runtime | Same Python/Requests/PySocks environment; standard library test framework |
+| Skill version | `2.10` |
+| CLI entry point | `python3 scripts/fns.py`, relative to the skill directory; on Windows use `.venv/Scripts/python.exe scripts/fns.py` |
+| Legacy entry point | `scripts/fns.sh`, unchanged thin `python3` launcher requiring POSIX `sh`; no interpreter autoselection or separate transport |
+| Runtime | Python 3.10+ on POSIX (macOS/Linux) or native Windows CPython via MSYS2, `requests[socks]>=2.34.2,<3`, `urllib3>=2.8.0,<3` |
+| Test runtime | Offline checks: same Python/Requests/PySocks environment and standard library framework; existing live runners: POSIX-only |
 
 The [official release][release] and [release metadata][release-api] identify the
 pin. All implementation links below use the full commit, not a moving branch.
@@ -25,12 +25,13 @@ There are two distinct layers: the script interface described in `SKILL.md`,
 and the pinned REST behavior below. CLI input validation, update prechecks,
 credential redaction, and recycle confirmations are script safeguards, not
 extra guarantees provided by the server. The upstream pin is unchanged by the
-Python transport refactor. Networking uses Requests/PySocks directly, with no
+Windows compatibility work. Networking uses Requests/PySocks directly, with no
 runtime SDK or Bash/curl/jq/iconv dependency for the Python entry point.
 
 Install all dependencies from skill-root `requirements.txt` using Python 3.10+.
 The urllib3 minimum supports independent HTTPS-proxy certificate policy for HTTP
-destinations; no separate manual networking-library install is needed:
+destinations; no separate manual networking-library install or new Windows
+dependencies are needed. POSIX setup:
 
 ```bash
 python3 -m venv .venv
@@ -38,7 +39,21 @@ python3 -m venv .venv
 . .venv/bin/activate
 ```
 
-Use the activated `python3` or `.venv/bin/python` for commands and tests. The
+On POSIX, use activated `python3` or `.venv/bin/python`. With Windows `uv` and
+native CPython from MSYS2, use this setup instead (from skill root):
+
+```bash
+uv venv --python 3.10 .venv
+uv pip install --python .venv/Scripts/python.exe -r requirements.txt
+.venv/Scripts/python.exe scripts/fns.py --help
+```
+
+For Windows CLI/offline-check examples, replace `python3` with the explicit
+`.venv/Scripts/python.exe`, or `obsidian-fastnotesync-skill/.venv/Scripts/python.exe`
+from repository root; do not assume activation selects Windows `python3` or use
+`.venv/bin` there. The unchanged `fns.sh` executes `python3`: select the correct
+interpreter first or invoke the executable directly. This substitution does not
+apply to the POSIX-only live runners. The
 [Requests release metadata][requests-release] declares Python 3.10+ support.
 
 ## Configuration, authentication, and transport
@@ -54,14 +69,15 @@ require an existing vault; discovery does not require a selected vault.
 | `FNS_TOKEN` | Required for authenticated token-mode commands; never implicit password fallback. |
 | `FNS_USERNAME`, `FNS_PASSWORD` | Required only for explicit password compatibility mode. |
 | `FNS_CLIENT` | Defaults to `obsidian-fastnotesync-skill`; token-mode `x-client`. |
-| `FNS_USER_AGENT` | Defaults to `obsidian-fastnotesync-skill/2.0.1`; stable across requests. |
+| `FNS_USER_AGENT` | Defaults to `obsidian-fastnotesync-skill/2.0.1`; fixed independently of CLI `VERSION` (`2.10`) and stable across requests. |
 | `FNS_PROXY` | Optional HTTP/HTTPS/SOCKS URL using `socks5`, `socks5h`, `http`, or `https`; authentication userinfo is supported through the environment only. |
-| `FNS_TIMEOUT` | Defaults to 30 seconds total wall-clock time per request, enforced with POSIX `SIGALRM`, not Requests' inactivity timeout. |
+| `FNS_TIMEOUT` | Defaults to 30 seconds total wall-clock time per request; POSIX `SIGALRM` or native Windows CLI watchdog, not Requests' inactivity timeout. |
 | `FNS_CONNECT_TIMEOUT` | Defaults to 10 seconds as an additional connection cap, within the total deadline. |
 | `FNS_ALLOW_HTTP` | Exactly `1` is required for non-loopback plain HTTP. HTTPS is preferred. |
 
-The default User-Agent changes from `obsidian-fastnotesync-skill/2.0.0` to
-`obsidian-fastnotesync-skill/2.0.1`. For a manual token bound to the old default,
+Version `2.10` preserves the default `obsidian-fastnotesync-skill/2.0.1`
+User-Agent independently of `VERSION`, so existing UA-bound tokens continue
+working. For a manual token bound to the older `2.0.0` default,
 securely configure non-secret `FNS_USER_AGENT='obsidian-fastnotesync-skill/2.0.0'`
 to reuse it, or provision a new token externally. Never auto-rotate credentials.
 
@@ -114,9 +130,17 @@ policy, including HTTP destinations. This does not encrypt the proxy-to-HTTP
 origin hop. See [urllib3 2.8 proxy TLS policy][urllib3-proxy-policy] and
 [Requests proxy/TLS documentation][requests-transport]. `FNS_TIMEOUT` covers
 proxy selection (including environment/platform lookup), request JSON
-serialization, body reading, and response JSON validation within its POSIX
-`SIGALRM` deadline, not merely Requests' inactivity timeout. The connection cap
-also applies. POSIX macOS/Linux is required; see [Python signals][python-signals].
+serialization, body reading, and response JSON validation, not merely Requests'
+inactivity timeout. POSIX retains unchanged `SIGALRM` handling; see
+[Python signals][python-signals]. Native Windows uses a per-request watchdog
+thread: on deadline expiry it attempts the existing generic transport-error JSON
+as best-effort output, waits up to 0.1 seconds for the report, then always calls
+`os._exit(3)` to terminate the entire CLI process, even if stdout is closed or blocked;
+no background request survives process exit. It relies on Python thread scheduling/GIL
+and is not hard-real-time. This is **CLI-only**, not an embeddable timeout mechanism
+for a long-lived library/host process. Requests' connect/read timeouts remain active,
+including the connection cap. Terminating the client does not undo requests already
+received or writes performed by the server.
 
 ## CLI and REST mapping
 
@@ -189,6 +213,11 @@ are optional selectors, not substitutes for paths. Full recycle clearing is the
 explicit exception. `ctime` and `mtime` are Unix milliseconds, not seconds.
 
 ### Path acceptance
+
+On Windows, local `--file` and `--content-file` arguments must use native paths
+such as `D:/data/image.png` or relative paths, not MSYS2 `/d/...` paths. Remote
+`--path` (and rename `--old-path`) values remain vault-relative POSIX paths,
+never local or drive-qualified paths.
 
 Transport URL encoding is not a guarantee of server path acceptance. Upstream
 [ValidatePath][path-validation] calls `QueryUnescape`; bare/unescaped `%` fails
@@ -429,10 +458,17 @@ the precheck, upload and verification. A `file_r` token cannot upload. `GET
 vault discovery. Manual tokens retain IP, UA and vault restrictions; neither
 upload nor readback rotates them or escalates permissions.
 
-The skill accepts one readable regular file, snapshots at most 10,485,760 bytes
-before login/network, verifies identity/size/mtime/ctime across the read, and
-sends unchanged binary bytes using Requests multipart encoding. Empty files
-are allowed. Binary paths must be strict relative POSIX paths; percentages,
+The skill accepts one readable regular file and snapshots at most 10,485,760
+bytes before login/network. Portable open flags retain binary mode (`O_BINARY`
+where available) and nonblocking mode where supported. Checks across the read
+retain file identity (`st_dev`/`st_ino`), size, and mtime. POSIX ctime checks are
+unchanged. Windows omits ctime only in the initial cross-source `path.stat()` vs
+opened `fstat()` comparison because CPython can report it inconsistently. All
+signature fields, including ctime, remain checked between opened/after-read
+`fstat()` results and between initial/final `path.stat()` results. These metadata
+checks conservatively detect changes, not an atomic filesystem snapshot.
+Requests multipart encoding sends unchanged binary bytes; empty files are
+allowed. Remote attachment paths must be strict relative POSIX paths; percentages,
 backslashes, empty/dot/parent segments, control characters and Windows-reserved
 characters are refused without normalization. No binary stdin or note-content
 options are added. The fixed cap bounds snapshot/multipart memory; it is not
@@ -480,8 +516,10 @@ Server/session chunk settings do not turn REST upload into resumable transfer.
 
 ## Verification
 
-Use Python 3.10+ with all installed `requirements.txt` dependencies. Tests use the
-standard library framework, not curl/mock-curl fixtures. From the repository root:
+Use Python 3.10+ with all installed `requirements.txt` dependencies. Offline tests
+use the standard library framework, not curl/mock-curl fixtures. From the
+repository root, use the configured interpreter (on Windows, substitute
+`obsidian-fastnotesync-skill/.venv/Scripts/python.exe` for `python3` below):
 
 ```bash
 # AST compilation checks syntax without executing the script or writing pycache.
@@ -503,11 +541,17 @@ fi
 
 `-B` prevents Python bytecode cache creation. Offline/mock checks cover parser,
 UTF-8, proxies, responses, redaction, transport, and preconditions; they do not
-prove real-server concurrency guarantees or live compatibility. Report syntax,
-documentation, unit-test, and live-test results separately.
+prove real-server concurrency guarantees or live compatibility. Report the
+OS/interpreter, platform-specific skips, syntax, documentation, unit-test, and
+live-test results separately. Optional Windows health/version smoke checks are
+public-only; they do not verify authentication or note/attachment read/write.
+The existing live runners below remain POSIX-only, distinct from the production
+CLI and offline checks; interpreter substitution does not port them or establish
+Windows live-write coverage.
 
 ### Opt-in live runner
 
+`tests/run_live.py` remains **POSIX-only**.
 **Live write tests require explicit authorization and an isolated test vault.**
 Prerequisites: `FNS_AUTH_MODE=token`, securely provisioned `FNS_BASE_URL` /
 `FNS_TOKEN`, and an existing dedicated `FNS_VAULT` named `fns-skill-test-*`,
@@ -529,6 +573,8 @@ Never include private instance URLs, actual vault names, credentials, live note
 data, or run-specific results in this documentation.
 
 ### Opt-in disposable-instance attachment runner
+
+`tests/run_upload_live.py` remains **POSIX-only**.
 
 `tests/run_upload_live.py` must point only at a fresh, independent FNS 3.6.1
 instance with isolated SQLite/config/storage, no production mounts and no

@@ -18,9 +18,9 @@ import json
 import logging
 import os
 from pathlib import Path
-import signal
 import subprocess
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 from urllib.parse import unquote, urlsplit
@@ -276,7 +276,7 @@ class UploadBase(support.CLIBase):
                 {key.lower(): value for key, value in prepared.headers.items()}, body)
             owner.calls.append({"request": captured, "kwargs": kwargs,
                 "session": session, "trust_env": session.trust_env,
-                "timer": signal.getitimer(signal.ITIMER_REAL)[0],
+                **owner.deadline_record(watchdogs),
                 "retries": {scheme: session.get_adapter(scheme + "://").max_retries.total
                             for scheme in ("http", "https")}})
             if on_request:
@@ -304,6 +304,7 @@ class UploadBase(support.CLIBase):
         logger.setLevel(logging.DEBUG)
         try:
             with contextlib.ExitStack() as stack:
+                watchdogs = stack.enter_context(self.observe_watchdogs())
                 stack.enter_context(mock.patch.dict(os.environ, environment, clear=True))
                 stack.enter_context(contextlib.redirect_stdout(output))
                 stack.enter_context(contextlib.redirect_stderr(errors))
@@ -366,10 +367,15 @@ class UploadBase(support.CLIBase):
 
 class UploadHTTPTests(UploadBase):
     def test_binary_multipart_chinese_path_vault_override_and_explicit_times(self):
-        self.upload_replies()
+        self.source = self.root / "本地 中文 附件😀.dat"
+        # O_TEXT would truncate at 0x1A or normalize CRLF on Windows. Exercise
+        # both through a real local Unicode filename and actual multipart HTTP.
+        payload = BINARY + "中文\r\n".encode("utf-8") + b"\x1a\r\nafter EOF\r\n"
+        self.source.write_bytes(payload)
+        self.upload_replies(final=metadata(payload=payload))
         result = self.run_cli(*self.arguments("--vault", "synthetic-override 文"))
         self.assert_success(result)
-        self.assert_upload_sequence(self.server.requests, vault="synthetic-override 文")
+        self.assert_upload_sequence(self.server.requests, payload=payload, vault="synthetic-override 文")
         for request in self.server.requests:
             self.assertEqual(request.headers.get("authorization"), "Bearer " + support.TOKEN)
             self.assertEqual(request.headers.get("user-agent"), support.DEFAULT_AGENT)
@@ -501,7 +507,7 @@ class UploadOfflineTests(UploadBase):
 
     def test_version_and_client_request_keyword_extension_preserve_identity(self):
         module = self.import_main()
-        self.assertEqual(module.VERSION, "2.0.1")
+        self.assertEqual(module.VERSION, "2.10")
         params = inspect.signature(module.Client.request).parameters
         additions = {"form", "files", "missing_file_ok"}
         self.assertTrue(additions.issubset(params),
@@ -530,7 +536,7 @@ class UploadOfflineTests(UploadBase):
                     if api == "path":
                         payload = self.source.read_bytes()
                     else:
-                        fd = os.open(self.source, os.O_RDONLY)
+                        fd = os.open(self.source, os.O_RDONLY | getattr(os, "O_BINARY", 0))
                         try:
                             payload = os.read(fd, len(BINARY) + 1)
                         finally:
@@ -637,30 +643,30 @@ class UploadOfflineTests(UploadBase):
                     self.assert_failure(result, 2)
                     self.assertEqual(self.calls, [], "Unsafe paths must not log in or send HTTP")
 
-    def test_missing_directory_fifo_and_oversized_sources_never_log_in_or_send_http(self):
-        fifo = self.root / "synthetic-fifo"
-        os.mkfifo(fifo)
+    def test_missing_directory_and_oversized_sources_never_log_in_or_send_http(self):
         large = self.root / "one-byte-too-large.bin"
         with large.open("wb") as stream:
             stream.truncate(MAX_BYTES + 1)
-        for source in (self.root / "nonexistent", self.root, fifo, large):
+        for source in (self.root / "nonexistent", self.root, large):
             for mode in ("token", "password"):
                 with self.subTest(source=source.name, mode=mode):
-                    if source == fifo:
-                        # A buggy blocking open must not hang the unittest process;
-                        # CLIBase's bounded subprocess kills it on timeout.
-                        self.replies()
-                        try:
-                            result = self.run_cli(*self.arguments(source=source),
-                                                  env={"FNS_AUTH_MODE": mode})
-                        except subprocess.TimeoutExpired:
-                            self.fail("FIFO upload blocked instead of rejecting a non-regular source")
-                        self.assert_failure(result, 2)
-                        self.assertEqual(self.server.requests, [])
-                    else:
-                        result = self.run_main(*self.arguments(source=source), env={"FNS_AUTH_MODE": mode})
-                        self.assert_failure(result, 2)
-                        self.assertEqual(self.calls, [])
+                    result = self.run_main(*self.arguments(source=source), env={"FNS_AUTH_MODE": mode})
+                    self.assert_failure(result, 2)
+                    self.assertEqual(self.calls, [])
+
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "mkfifo"), "POSIX FIFO source")
+    def test_fifo_source_never_blocks_logs_in_or_sends_http(self):
+        fifo = self.root / "synthetic-fifo"
+        os.mkfifo(fifo)
+        for mode in ("token", "password"):
+            with self.subTest(mode=mode):
+                self.replies()
+                try:
+                    result = self.run_cli(*self.arguments(source=fifo), env={"FNS_AUTH_MODE": mode})
+                except subprocess.TimeoutExpired:
+                    self.fail("FIFO upload blocked instead of rejecting a non-regular source")
+                self.assert_failure(result, 2)
+                self.assertEqual(self.server.requests, [])
 
     def test_unreadable_source_is_rejected_before_password_login(self):
         original_io_open, original_open, original_os_open = io.open, open, os.open
@@ -683,11 +689,18 @@ class UploadOfflineTests(UploadBase):
         self.assertEqual(self.calls, [])
 
     def test_source_changes_during_snapshot_fail_before_any_login_or_http(self):
+        original_stat = Path.stat
         for change in ("grow", "shrink", "same-size-edit", "mtime-only", "replace-inode"):
             with self.subTest(change=change):
                 self.source.write_bytes(BINARY)
                 before = self.source.stat()
                 changed = []
+                replacement_stats = []
+
+                def stat_path(path, *args, **kwargs):
+                    if path == self.source and replacement_stats:
+                        return replacement_stats[0]
+                    return original_stat(path, *args, **kwargs)
 
                 def mutate(_data):
                     if changed:
@@ -706,13 +719,92 @@ class UploadOfflineTests(UploadBase):
                         replacement = self.root / "replacement.bin"
                         replacement.write_bytes(BINARY)
                         os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
-                        os.replace(replacement, self.source)
+                        if os.name == "nt":
+                            # CRT file sharing disallows replacing the open source.
+                            # Expose the real replacement's stat at the restat seam.
+                            replacement_stats.append(replacement.stat())
+                            self.assertNotEqual(replacement_stats[0].st_ino, before.st_ino)
+                        else:
+                            os.replace(replacement, self.source)
 
-                with self.observe_reads(mutate):
+                with self.observe_reads(mutate), mock.patch.object(Path, "stat", stat_path):
                     result = self.run_main(*self.arguments(), env={"FNS_AUTH_MODE": "password"})
                 self.assertTrue(changed, "Must actually exercise the source's binary read")
                 self.assert_failure(result, 2)
                 self.assertEqual(self.calls, [], "A changing snapshot must fail before login")
+
+    def test_snapshot_checks_identity_size_and_times_at_open_and_after_read(self):
+        original_stat, original_fstat = Path.stat, os.fstat
+        attributes = ("st_mode", "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        final = metadata()
+        for phase in ("opened", "after-read", "restat"):
+            for field in attributes[1:]:
+                with self.subTest(phase=phase, field=field):
+                    stats, fstats, changed = [], [], []
+
+                    def altered(info):
+                        changed.append(True)
+                        return SimpleNamespace(**{key: getattr(info, key) + (key == field)
+                                                 for key in attributes})
+
+                    def stat_path(path, *args, **kwargs):
+                        info = original_stat(path, *args, **kwargs)
+                        if path == self.source:
+                            stats.append(info)
+                            if phase == "restat" and len(stats) == 2:
+                                return altered(info)
+                        return info
+
+                    def fstat(fd):
+                        info = original_fstat(fd)
+                        fstats.append(info)
+                        if ((phase == "opened" and len(fstats) == 1) or
+                                (phase == "after-read" and len(fstats) == 2)):
+                            return altered(info)
+                        return info
+
+                    with mock.patch.object(Path, "stat", stat_path), mock.patch("os.fstat", fstat):
+                        result = self.run_main(*self.arguments(), replies=[missing(),
+                            support.envelope(final), support.envelope(final)])
+                    self.assertEqual(changed, [True], "Must reach the selected stat comparison")
+                    self.assert_failure(result, 2)
+                    self.assertEqual(self.calls, [], "Snapshot mismatch must precede HTTP")
+
+    def test_stable_cross_source_ctime_difference_is_allowed_only_on_windows(self):
+        self.import_main()
+        original_fstat = os.fstat
+        before = self.source.stat()
+        attributes = ("st_mode", "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        final = metadata()
+        for mutation in (False, True):
+            with self.subTest(fd_ctime_changes=mutation):
+                observed = []
+
+                def fstat(fd):
+                    info = original_fstat(fd)
+                    values = {key: getattr(info, key) for key in attributes}
+                    # Both fd stats deliberately differ from the path baseline.
+                    # Only the second fd stat changes in the mutation variant.
+                    values["st_ctime_ns"] = before.st_ctime_ns + 1000000000 + bool(observed and mutation)
+                    observed.append(values)
+                    return SimpleNamespace(**values)
+
+                with mock.patch("os.fstat", fstat):
+                    result = self.run_main(*self.arguments(), env={"FNS_AUTH_MODE": "password"},
+                        replies=[support.envelope({"token": support.LOGIN_TOKEN}), missing(),
+                                 support.envelope(final), support.envelope(final)])
+                self.assertTrue(observed, "Must reach the descriptor snapshot")
+                for info in observed:
+                    for field in attributes[:-1]:
+                        self.assertEqual(info[field], getattr(before, field))
+                if os.name == "nt":
+                    self.assertEqual(len(observed), 2, "Compare ctime within the descriptor source")
+                if os.name == "nt" and not mutation:
+                    self.assert_success(result)
+                    self.assert_upload_sequence(self.captured()[1:])
+                else:
+                    self.assert_failure(result, 2)
+                    self.assertEqual(self.calls, [], "A ctime mutation must fail before login/HTTP")
 
     def test_snapshot_precedes_login_and_http_and_is_not_reread_afterwards(self):
         for mode in ("token", "password"):
@@ -752,6 +844,8 @@ class UploadOfflineTests(UploadBase):
         for phase in ("success", "fdopen-error", "fdopen-interrupt", "fstat-error",
                       "read-error", "read-interrupt", "restat-error", "fifo-swap-before-open"):
             with self.subTest(phase=phase):
+                if phase == "fifo-swap-before-open" and not hasattr(os, "mkfifo"):
+                    self.skipTest("POSIX regular-file-to-FIFO syscall race")
                 self.source.unlink(missing_ok=True)
                 self.source.write_bytes(BINARY)
                 descriptors, streams, restats = [], [], []
@@ -759,6 +853,9 @@ class UploadOfflineTests(UploadBase):
 
                 def open_source(path, flags, *args, **kwargs):
                     if Path(path) == self.source:
+                        if os.name == "nt":
+                            self.assertTrue(flags & os.O_BINARY,
+                                            "Windows snapshot descriptors must preserve original bytes")
                         if phase == "fifo-swap-before-open":
                             self.source.unlink()
                             os.mkfifo(self.source)
@@ -1066,8 +1163,7 @@ class UploadOfflineTests(UploadBase):
                     self.assertEqual(call["kwargs"].get("verify"), str(ca))
                     self.assertEqual(call["kwargs"].get("timeout"), (2, 5))
                     self.assertEqual(call["retries"], {"http": 0, "https": 0})
-                    self.assertGreater(call["timer"], 0)
-                    self.assertLessEqual(call["timer"], 5)
+                    self.assert_request_deadline(call, 5)
                     self.assertEqual(call["request"].headers["x-client"], "webgui")
                     self.assertEqual(call["request"].headers["user-agent"], support.DEFAULT_AGENT)
                 self.assertIsNone(self.calls[2]["kwargs"].get("json"))

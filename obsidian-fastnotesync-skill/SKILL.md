@@ -9,34 +9,38 @@ description: >
   Obsidian installation.
 license: MIT
 compatibility: >
-  Requires Python 3.10+ on POSIX (macOS/Linux), requests[socks]>=2.34.2,<3,
+  Requires Python 3.10+ on POSIX (macOS/Linux) or native Windows CPython via
+  MSYS2, requests[socks]>=2.34.2,<3,
   urllib3>=2.8.0,<3, and network access to Fast Note Sync Service. Tests use
   Python's standard library test framework and the same runtime dependencies.
 metadata:
   author: https://github.com/zqcli
-  version: "2.0.1"
+  version: "2.10"
 allowed-tools: Bash
 ---
 
 # Obsidian FastNoteSync Skill
 
 Use `python3 scripts/fns.py` for note operations, attachment upload/metadata,
-vault discovery, and diagnostics. The attachment extension keeps the existing
-`2.0.1` User-Agent identity so bound tokens do not silently stop working.
+vault discovery, and diagnostics; substitute the Windows interpreter below.
+The default User-Agent stays `obsidian-fastnotesync-skill/2.0.1`, independent of
+CLI `VERSION` (`2.10`), so existing UA-bound tokens continue working.
 Resolve script and reference paths relative to this skill directory, not the
 caller's working directory. Examples below run from the skill directory using
 the configured Python environment. `scripts/fns.sh` remains a thin compatible
 legacy launcher requiring POSIX `sh` and forwarding arguments to Python, not a
-separate HTTP transport.
+separate HTTP transport. It still invokes `python3`, without interpreter
+autoselection: select the correct `python3` first or invoke the executable directly.
 
 ## Setup
 
-Python 3.10+ on POSIX (macOS/Linux), `requests[socks]>=2.34.2,<3`, and
-`urllib3>=2.8.0,<3` are required. The urllib3 minimum supports an independent
-HTTPS-proxy certificate policy, including requests to HTTP destinations.
+Python 3.10+ on POSIX (macOS/Linux) or native Windows CPython via MSYS2,
+`requests[socks]>=2.34.2,<3`, and `urllib3>=2.8.0,<3` are required; Windows adds
+no dependencies. The urllib3 minimum supports independent HTTPS-proxy certificate
+policy, including requests to HTTP destinations.
 Install all dependencies together from skill-root `requirements.txt`; no
 separate manual networking-library install, Bash/curl/jq/iconv, or runtime SDK
-is required by the Python entry point. Use a virtual environment:
+is required by the Python entry point. On POSIX, use a virtual environment:
 
 ```bash
 python3 -m venv .venv
@@ -44,8 +48,20 @@ python3 -m venv .venv
 . .venv/bin/activate
 ```
 
-Activation makes the examples' `python3` use the installed dependencies. You may
-instead invoke `.venv/bin/python` directly. Keep secrets out of setup commands.
+On POSIX, activation makes the examples' `python3` use the installed dependencies.
+You may instead invoke `.venv/bin/python` directly. For native Windows CPython,
+use Windows `uv` from MSYS2:
+
+```bash
+uv venv --python 3.10 .venv
+uv pip install --python .venv/Scripts/python.exe -r requirements.txt
+.venv/Scripts/python.exe scripts/fns.py --help
+```
+
+In Windows CLI/offline-check examples, replace `python3` with
+`.venv/Scripts/python.exe` (or `obsidian-fastnotesync-skill/.venv/Scripts/python.exe`
+from the repository root). Do not assume activation selects a Windows `python3`
+or use `.venv/bin` on Windows. Keep secrets out of setup commands.
 
 The REST contract is frozen to official upstream tag **3.6.1**, commit
 `7a6c78792c631f999c8a5f725bba5dd7235d6688`, published **August 14, 2026**.
@@ -63,15 +79,14 @@ source links, response handling, and concurrency limitations.
 | `FNS_PROXY` | Optional | HTTP/HTTPS/SOCKS proxy URL: `socks5://`, `socks5h://`, `http://`, or `https://`; authenticated URLs are supported through the environment only. |
 | `FNS_CLIENT` | `obsidian-fastnotesync-skill` | `x-client` in token mode; must match the token's permissions. |
 | `FNS_USER_AGENT` | `obsidian-fastnotesync-skill/2.0.1` | Stable User-Agent for every request. |
-| `FNS_TIMEOUT` | `30` | Total wall-clock deadline in seconds per request, enforced with POSIX `SIGALRM`, not an inactivity timeout. |
+| `FNS_TIMEOUT` | `30` | Total wall-clock deadline in seconds per request: POSIX `SIGALRM` or native Windows CLI watchdog, not an inactivity timeout. |
 | `FNS_CONNECT_TIMEOUT` | `10` | Additional cap on connection time in seconds, within the total deadline. |
 | `FNS_ALLOW_HTTP` | Unset | Must be exactly `1` to permit non-loopback plain HTTP. |
 | `FNS_AUTH_MODE` | `token` | Only explicit `password` selects compatibility login. |
 | `FNS_USERNAME` / `FNS_PASSWORD` | Required only in password mode | Login credentials provided through the environment, not command arguments. |
 
-**Upgrade compatibility:** the default User-Agent changes from
-`obsidian-fastnotesync-skill/2.0.0` to `obsidian-fastnotesync-skill/2.0.1`.
-To reuse a manual token bound to the old default, securely configure the
+**Upgrade compatibility:** version `2.10` keeps the `2.0.1` default User-Agent.
+To reuse a manual token bound to the older `2.0.0` default, securely configure the
 non-secret `FNS_USER_AGENT='obsidian-fastnotesync-skill/2.0.0'`, or provision a
 new token externally. Never automatically rotate or replace credentials.
 
@@ -147,10 +162,16 @@ No logging/tracing, redirect following, retries, automatic token refresh, or
 failure-triggered re-login. Do not enable shell tracing (`set -x`) or HTTP debug
 logs. Error messages are intentionally generic to prevent upstream echo leaks.
 Normal JSON output and diagnostics redact known credentials; see below.
-`FNS_TIMEOUT` is a POSIX `SIGALRM` wall-clock deadline for each request, including
-environment/platform proxy selection, request JSON serialization, body reading,
-and response JSON validation, not merely Requests' connect/read inactivity
-timeout. `FNS_CONNECT_TIMEOUT` additionally caps connection time.
+`FNS_TIMEOUT` covers each request's wall-clock time, including environment/platform
+proxy selection, request JSON serialization, body reading, and response JSON
+validation. POSIX `SIGALRM` handling is unchanged. Native Windows uses a per-request
+watchdog thread: on deadline expiry it attempts the existing generic transport-error
+JSON as best-effort output, waits up to 0.1 seconds for the report, then always calls
+`os._exit(3)` to terminate the entire CLI process, even if stdout is closed or blocked;
+no background request survives process exit. It relies on Python thread scheduling/GIL
+and is not hard-real-time. This is **CLI-only, not embeddable in a long-lived library/host process**.
+Requests' connect/read timeouts remain active; `FNS_CONNECT_TIMEOUT` also caps
+connection time. Process termination does not undo a server-side write.
 
 ## CLI conventions
 
@@ -168,6 +189,9 @@ bare/unescaped `%` with `444` on validated paths. The client must not silently
 rewrite a requested filename to contain literal `%25` as a workaround; that is
 a different filename. See the pinned validator in the API contract.
 `ctime` and `mtime` values are Unix timestamps in milliseconds.
+On Windows, local `--file` / `--content-file` values must be native paths such as
+`D:/data/image.png` or relative paths, not MSYS2 `/d/...` paths. Remote `--path`
+and rename `--old-path` values are always vault-relative POSIX paths, never local paths.
 
 Literal `--content`, content-file, and stdin note content must be valid UTF-8.
 Python strictly validates UTF-8; files/stdin are read as bytes and decoded without
@@ -359,7 +383,13 @@ file-info   --path REL
 Require an existing vault and a token allowing `rest`, `FNS_CLIENT`, `file_rw`
 (upload) or `file_r` (metadata); IP/UA/vault restrictions apply. Snapshot a regular
 binary file **before login/network**, maximum **10 MiB (10,485,760 bytes)**;
-empty files work, source changes fail locally. Multipart is not streaming/chunking.
+empty files work; detected source changes fail locally. Portable binary open flags
+preserve bytes; identity (`st_dev`/`st_ino`), size, and mtime checks remain. POSIX ctime
+checks are unchanged. Windows omits ctime only in the initial cross-source
+`path.stat()` vs opened `fstat()` comparison because CPython can report it inconsistently.
+All signature fields, including ctime, remain checked between opened/after-read
+`fstat()` results and between initial/final `path.stat()` results.
+Multipart is not streaming/chunking.
 
 `--path` is an exact relative POSIX filename; Chinese/spaces/emoji work. Reject
 absolute paths, empty/dot/parent segments, repeated/trailing slashes, backslashes,
@@ -437,6 +467,9 @@ restore, chunked upload, history, backlinks/outlinks, and vault management remai
 commands. `tests/run_upload_live.py` is an opt-in test harness, not a production
 attachment download API.
 
+On Windows, substitute `obsidian-fastnotesync-skill/.venv/Scripts/python.exe`
+for `python3` in the offline commands below.
+
 Tests use Python 3.10+'s standard library test framework with the installed
 runtime dependencies, not curl/mock-curl fixtures. Use the same Python
 environment for commands and tests. From the repository root, run:
@@ -461,8 +494,13 @@ fi
 
 Report documentation checks, script syntax/lint checks, unit tests, and live
 tests separately; offline checks do not establish live-server compatibility.
+Optional Windows health/version smoke checks are public-only, not authentication
+or note/attachment read/write verification.
 
-### Opt-in live tests
+### Opt-in live tests (POSIX-only)
+
+Both existing live runners remain POSIX-only, unlike the production CLI and offline
+tests; interpreter substitution does not establish Windows live-write coverage.
 
 **Live write tests require explicit authorization and an isolated test vault.**
 Use `FNS_AUTH_MODE=token`, securely provisioned `FNS_BASE_URL` / `FNS_TOKEN`, and
@@ -486,7 +524,7 @@ Keep all tests within that dedicated vault, never ordinary user notes. Do not
 include private instance URLs, actual vault names, credentials, live note data,
 or run-specific results in this documentation.
 
-### Disposable-instance upload tests
+### Disposable-instance upload tests (POSIX-only)
 
 Use a **fresh disposable FNS 3.6.1 instance**, independent SQLite/config/storage,
 never production. Loopback/tunnel alone is not isolation. Run from skill root:
